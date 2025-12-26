@@ -8,7 +8,8 @@ use glommio::{
     enclose,
     io::{
         BufferedFile, DmaFile, DmaStreamReader, DmaStreamReaderBuilder, DmaStreamWriterBuilder,
-        MergedBufferLimit, ReadAmplificationLimit, StreamReaderBuilder, StreamWriterBuilder,
+        MergedBufferLimit, OpenOptions, ReadAmplificationLimit, StreamReaderBuilder,
+        StreamWriterBuilder,
     },
     LocalExecutorBuilder, Placement,
 };
@@ -305,7 +306,7 @@ fn main() {
     let mut dir = PathBuf::from(path);
     assert!(dir.exists());
     dir.push("benchfiles");
-    assert!(!dir.exists(), "{dir:?} already exists");
+    //assert!(!dir.exists(), "{dir:?} already exists");
     let dir = BenchDirectory::new(dir);
 
     let total_memory = sys_info::mem_info().unwrap().total << 10;
@@ -313,7 +314,7 @@ fn main() {
     let file_size = matches
         .get_one::<u64>("file_size")
         .map(|s| s << 30)
-        .unwrap_or(total_memory * 2);
+        .unwrap_or(1 << 30);
 
     let random = total_memory / 10;
 
@@ -326,10 +327,22 @@ fn main() {
             let mut buf_filename = dir.path.clone();
             buf_filename.push("benchfile-buf-1");
 
-            let file = BufferedFile::create(&buf_filename).await.unwrap();
-            let stream = StreamWriterBuilder::new(file).build();
-            stream_write(stream, "Buffered I/O", file_size).await;
+            //let file = DmaFile::open("/opt/shoal/glom_tests/hello").await.unwrap();
+            //let file = OpenOptions::new()
+            //    //.read(true)
+            //    .write(true)
+            //    .create(true)
+            //    .truncate(true)
+            //    .dma_open("/opt/shoal/glom_tests/hello")
+            //    .await
+            //    .unwrap();
+            //let read = file.read_at(0, 10).await.unwrap();
+            //println!("Read -> {:?}", String::from_utf8(read.to_vec()));
 
+            //let file = BufferedFile::create(&buf_filename).await.unwrap();
+            //let stream = StreamWriterBuilder::new(file).build();
+            //stream_write(stream, "Buffered I/O", file_size).await;
+            println!("Writting to {}", dio_filename.display());
             let file = DmaFile::create(&dio_filename).await.unwrap();
             let stream = DmaStreamWriterBuilder::new(file)
                 .with_write_behind(1)
@@ -337,79 +350,79 @@ fn main() {
                 .build();
             stream_write(stream, "Direct I/O", file_size).await;
 
-            let file = DmaFile::create(&dio_filename).await.unwrap();
-            let stream = DmaStreamWriterBuilder::new(file)
-                .with_write_behind(10)
-                .with_buffer_size(512 << 10)
-                .build();
-            stream_write(stream, "Direct I/O, write-behind", file_size).await;
+            //let file = DmaFile::create(&dio_filename).await.unwrap();
+            //let stream = DmaStreamWriterBuilder::new(file)
+            //    .with_write_behind(10)
+            //    .with_buffer_size(512 << 10)
+            //    .build();
+            //stream_write(stream, "Direct I/O, write-behind", file_size).await;
 
-            let file = BufferedFile::open(&buf_filename).await.unwrap();
-            let stream = StreamReaderBuilder::new(file).build();
-            let stream = stream_scan(stream, "Buffered I/O").await;
-            stream.close().await.unwrap();
+            //let file = BufferedFile::open(&buf_filename).await.unwrap();
+            //let stream = StreamReaderBuilder::new(file).build();
+            //let stream = stream_scan(stream, "Buffered I/O").await;
+            //stream.close().await.unwrap();
 
-            let file = DmaFile::open(&dio_filename).await.unwrap();
-            let stream = DmaStreamReaderBuilder::new(file)
-                .with_read_ahead(1)
-                .with_buffer_size(4 << 10)
-                .build();
-            let stream = stream_scan(stream, "Direct I/O").await;
-            stream.close().await.unwrap();
+            //let file = DmaFile::open(&dio_filename).await.unwrap();
+            //let stream = DmaStreamReaderBuilder::new(file)
+            //    .with_read_ahead(1)
+            //    .with_buffer_size(4 << 10)
+            //    .build();
+            //let stream = stream_scan(stream, "Direct I/O").await;
+            //stream.close().await.unwrap();
 
-            let file = DmaFile::open(&dio_filename).await.unwrap();
-            let stream = DmaStreamReaderBuilder::new(file)
-                .with_read_ahead(50)
-                .with_buffer_size(4 << 10)
-                .build();
-            let stream = stream_scan(stream, "Direct I/O, read ahead").await;
-            stream.close().await.unwrap();
+            //let file = DmaFile::open(&dio_filename).await.unwrap();
+            //let stream = DmaStreamReaderBuilder::new(file)
+            //    .with_read_ahead(50)
+            //    .with_buffer_size(4 << 10)
+            //    .build();
+            //let stream = stream_scan(stream, "Direct I/O, read ahead").await;
+            //stream.close().await.unwrap();
 
-            let file = DmaFile::open(&dio_filename).await.unwrap();
-            let stream = DmaStreamReaderBuilder::new(file)
-                .with_read_ahead(50)
-                .with_buffer_size(4 << 10)
-                .build();
-            stream_scan_alt_api(stream, "Direct I/O, glommio API", 4 << 10).await;
+            //let file = DmaFile::open(&dio_filename).await.unwrap();
+            //let stream = DmaStreamReaderBuilder::new(file)
+            //    .with_read_ahead(50)
+            //    .with_buffer_size(4 << 10)
+            //    .build();
+            //stream_scan_alt_api(stream, "Direct I/O, glommio API", 4 << 10).await;
 
-            let file = DmaFile::open(&dio_filename).await.unwrap();
-            let stream = DmaStreamReaderBuilder::new(file)
-                .with_read_ahead(10)
-                .with_buffer_size(512 << 10)
-                .build();
-            stream_scan_alt_api(stream, "Direct I/O, glommio API, large buffer", 512 << 10).await;
+            //let file = DmaFile::open(&dio_filename).await.unwrap();
+            //let stream = DmaStreamReaderBuilder::new(file)
+            //    .with_read_ahead(10)
+            //    .with_buffer_size(512 << 10)
+            //    .build();
+            //stream_scan_alt_api(stream, "Direct I/O, glommio API, large buffer", 512 << 10).await;
 
-            let file = BufferedFile::open(&buf_filename).await.unwrap();
-            random_read(Reader::Buffered(file), "Buffered I/O", random, 50, 4096).await;
+            //let file = BufferedFile::open(&buf_filename).await.unwrap();
+            //random_read(Reader::Buffered(file), "Buffered I/O", random, 50, 4096).await;
 
-            let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
-            random_read(Reader::Direct(file), "Direct I/O", random, 50, 4096).await;
+            //let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
+            //random_read(Reader::Direct(file), "Direct I/O", random, 50, 4096).await;
 
-            let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
-            random_many_read(Reader::Direct(file), "Direct I/O", random, 50, 4096, 0).await;
+            //let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
+            //random_many_read(Reader::Direct(file), "Direct I/O", random, 50, 4096, 0).await;
 
-            let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
-            random_many_read(Reader::Direct(file), "Direct I/O", random, 50, 4096, 131072).await;
+            //let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
+            //random_many_read(Reader::Direct(file), "Direct I/O", random, 50, 4096, 131072).await;
 
-            let file = BufferedFile::open(&buf_filename).await.unwrap();
-            random_read(Reader::Buffered(file), "Buffered I/O", file_size, 50, 4096).await;
+            //let file = BufferedFile::open(&buf_filename).await.unwrap();
+            //random_read(Reader::Buffered(file), "Buffered I/O", file_size, 50, 4096).await;
 
-            let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
-            random_read(Reader::Direct(file), "Direct I/O", file_size, 50, 4096).await;
+            //let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
+            //random_read(Reader::Direct(file), "Direct I/O", file_size, 50, 4096).await;
 
-            let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
-            random_many_read(Reader::Direct(file), "Direct I/O", file_size, 50, 4096, 0).await;
+            //let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
+            //random_many_read(Reader::Direct(file), "Direct I/O", file_size, 50, 4096, 0).await;
 
-            let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
-            random_many_read(
-                Reader::Direct(file),
-                "Direct I/O",
-                file_size,
-                50,
-                4096,
-                131072,
-            )
-            .await;
+            //let file = Rc::new(DmaFile::open(&dio_filename).await.unwrap());
+            //random_many_read(
+            //    Reader::Direct(file),
+            //    "Direct I/O",
+            //    file_size,
+            //    50,
+            //    4096,
+            //    131072,
+            //)
+            //.await;
         })
         .unwrap();
 

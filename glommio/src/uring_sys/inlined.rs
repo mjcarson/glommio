@@ -4,6 +4,7 @@ use crate::uring_sys;
 use std::ptr;
 use std::sync::atomic::{fence, Ordering};
 
+/// THIS IS NOT NEEDED AS WE CAN HAVE IT EXPOSE THE FUNCTION BUT I THIK ITS SLOWER?
 /// Reimplementation of io_uring_get_sqe for liburing 2.2+
 #[inline]
 pub(crate) unsafe fn get_sqe(ring: *mut uring_sys::io_uring) -> *mut uring_sys::io_uring_sqe {

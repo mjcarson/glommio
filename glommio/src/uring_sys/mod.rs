@@ -1,6 +1,6 @@
 use crate::sys::Statx;
 
-pub mod inlined;
+//pub mod inlined;
 pub mod syscalls;
 
 pub const LIBURING_UDATA_TIMEOUT: libc::__u64 = libc::__u64::MAX;
