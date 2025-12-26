@@ -31,7 +31,8 @@ impl<'ring> SubmissionQueue<'ring> {
     /// After that, will return `None`.
     pub fn prepare_sqe(&mut self) -> Option<SQE<'_>> {
         unsafe {
-            let sqe = uring_sys::io_uring_get_sqe(self.ring.as_mut());
+            // get our submission queue entry
+            let sqe = uring_sys::inlined::get_sqe(self.ring.as_mut());
             if !sqe.is_null() {
                 uring_sys::io_uring_prep_nop(sqe);
                 Some(SQE::new(&mut *sqe))

@@ -10,12 +10,12 @@ fn main() {
     let liburing = match env::var("GLOMMIO_LIBURING_DIR") {
         Ok(path) => PathBuf::from(path).canonicalize().unwrap(),
         Err(_) => {
-            Command::new("git")
-                .arg("submodule")
-                .arg("update")
-                .arg("--init")
-                .status()
-                .unwrap();
+            //Command::new("git")
+            //    .arg("submodule")
+            //    .arg("update")
+            //    .arg("--init")
+            //    .status()
+            //    .unwrap();
 
             project.join("liburing")
         }

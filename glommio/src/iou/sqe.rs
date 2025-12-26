@@ -639,7 +639,8 @@ impl<'ring> SQEs<'ring> {
     fn consume(&mut self) -> Option<SQE<'ring>> {
         if self.consumed < self.count {
             unsafe {
-                let sqe = uring_sys::io_uring_get_sqe(self.sq);
+                // get our submission queue entry
+                let sqe = uring_sys::inlined::get_sqe(self.sq);
                 uring_sys::io_uring_prep_nop(sqe);
                 self.consumed += 1;
                 Some(SQE { sqe: &mut *sqe })
