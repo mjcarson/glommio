@@ -1,6 +1,6 @@
 use crate::sys::Statx;
 
-//pub mod inlined;
+pub mod inlined;
 pub mod syscalls;
 
 pub const LIBURING_UDATA_TIMEOUT: libc::__u64 = libc::__u64::MAX;
@@ -351,7 +351,7 @@ extern "C" {
 
     pub fn io_uring_submit_and_wait(ring: *mut io_uring, wait_nr: libc::c_uint) -> libc::c_int;
 
-    pub fn io_uring_get_sqe(ring: *mut io_uring) -> *mut io_uring_sqe;
+    //pub fn io_uring_get_sqe(ring: *mut io_uring) -> *mut io_uring_sqe;
 
     pub fn io_uring_register_buffers(
         ring: *mut io_uring,

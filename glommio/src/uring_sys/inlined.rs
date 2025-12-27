@@ -1,32 +1,35 @@
-// In glommio/src/uring_sys/inline_helpers.rs or similar
+//! Rust implementations of inlined functions that are no longer exported by
+//! liburing by default.
 
 use crate::uring_sys;
 use std::ptr;
-use std::sync::atomic::{fence, Ordering};
 
-/// THIS IS NOT NEEDED AS WE CAN HAVE IT EXPOSE THE FUNCTION BUT I THIK ITS SLOWER?
-/// Reimplementation of io_uring_get_sqe for liburing 2.2+
+/// Get the size of our SQE object
+const SQE_SIZE: usize = std::mem::size_of::<uring_sys::io_uring_sqe>();
+
+/// Gets a pointer to the next available submission queue entry or null if this queue is full
+///
+/// # Arguments
+///
+/// * `ring` - The ring to get the next available submission queue entry from
 #[inline]
 pub(crate) unsafe fn get_sqe(ring: *mut uring_sys::io_uring) -> *mut uring_sys::io_uring_sqe {
+    // get a mutable ref to this rings submission queue
     let sq = &mut (*ring).sq;
-    let next = sq.sqe_tail;
-    // Get current head - different for SQPOLL vs normal mode
-    let head = if (*ring).flags & uring_sys::IORING_SETUP_SQPOLL != 0 {
-        // In SQPOLL mode, the kernel thread updates khead
-        fence(Ordering::Acquire);
-        ptr::read_volatile(sq.khead)
-    } else {
-        // In normal mode, we track it ourselves
-        sq.sqe_head
-    };
-    // Check if queue is full
-    if next - head >= *sq.kring_entries {
+    // get the next tail value
+    let next = sq.sqe_tail.wrapping_add(1);
+    // Check if submission queue is full
+    if next.wrapping_sub(sq.sqe_head) > *sq.kring_entries {
+        // our submission queue is full so just return null
         return ptr::null_mut();
     }
-    // Calculate index and get SQE
-    let index = next & *sq.kring_mask;
+    // Calculate the index with proper masking
+    let index = sq.sqe_tail & *sq.kring_mask;
+    // get a pointer to the SQE we are going to write to
     let sqe = sq.sqes.offset(index as isize);
-    // Update tail
-    sq.sqe_tail = next.wrapping_add(1);
+    // make sure this submission queue entry doesn't contain any old data
+    ptr::write_bytes(sqe as *mut u8, 0, SQE_SIZE);
+    // update our submission queue to point at the next available entry
+    sq.sqe_tail = next;
     sqe
 }
