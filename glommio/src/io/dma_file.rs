@@ -211,7 +211,11 @@ impl DmaFile {
     ) -> io::Result<DmaFile> {
         let file = GlommioFile::open_at(dir, path, flags, mode).await?;
         let (major, minor) = (file.dev_major as usize, file.dev_minor as usize);
-        let buf = statfs(path).unwrap();
+        // on the descriptor rather than the path, since the path can stop being reachable
+        // between the open and here - a directory whose permissions were taken away - and a
+        // statfs that cannot disagree with the open must not panic the task that opened it
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) };
+        let buf = fstatfs(borrowed).map_err(io::Error::from)?;
         let fstype = buf.filesystem_type();
         let max_sectors_size = sysfs::BlockDevice::max_sectors_size(major, minor);
         let max_segment_size = sysfs::BlockDevice::max_segment_size(major, minor);
