@@ -800,6 +800,7 @@ struct DmaStreamWriterState {
     buffer_pos: usize,
     write_behind: usize,
     sync_on_close: bool,
+    pending_sync: Option<task::JoinHandle<()>>,
 }
 
 macro_rules! already_closed {
@@ -855,6 +856,11 @@ impl DmaStreamWriterState {
 
             for flush in pending.drain(..) {
                 flush.await;
+            }
+
+            let pending_sync = { state.borrow_mut().pending_sync.take() };
+            if let Some(h) = pending_sync {
+                h.await;
             }
 
             let must_adjust = {
@@ -977,6 +983,10 @@ impl Drop for DmaStreamWriterState {
             self.take_pending_handles().is_empty(),
             "DmaStreamerWriter::drop() should have cancelled pending flushes"
         );
+        assert!(
+            self.pending_sync.is_none(),
+            "DmaStreamWriter::drop() should have cancelled pending sync"
+        );
     }
 }
 
@@ -986,6 +996,9 @@ impl Drop for DmaStreamWriter {
         let mut pending = state.take_pending_handles();
         for flush in pending.drain(..) {
             flush.cancel();
+        }
+        if let Some(sync_handle) = state.pending_sync.take() {
+            sync_handle.cancel();
         }
         if state.must_truncate() {
             let file = self.file.take().unwrap();
@@ -1033,6 +1046,7 @@ impl DmaStreamWriter {
             aligned_pos: 0,
             buffer_pos: 0,
             synced_pos: 0,
+            pending_sync: None,
         };
 
         let state = Rc::new(RefCell::new(state));
@@ -1111,6 +1125,21 @@ impl DmaStreamWriter {
         self.state.borrow().flushed_pos()
     }
 
+    /// Acquires the current synced position of the file.
+    ///
+    /// This is the position up to which data has been durably persisted via
+    /// [`fdatasync`]. Data beyond this position may have been written but is
+    /// not guaranteed to survive a crash or power loss.
+    ///
+    /// This is useful in combination with [`sync_background`] to check whether
+    /// a background sync has completed.
+    ///
+    /// [`fdatasync`]: https://man7.org/linux/man-pages/man2/fdatasync.2.html
+    /// [`sync_background`]: Self::sync_background
+    pub fn current_synced_pos(&self) -> u64 {
+        self.state.borrow().synced_pos
+    }
+
     async fn flush_inner(&self, partial: bool) -> Result<u64> {
         let (target_pos, mut pending) = {
             let mut state = self.state.borrow_mut();
@@ -1134,6 +1163,7 @@ impl DmaStreamWriter {
     }
 
     async fn sync_inner(&self) -> Result<u64> {
+        self.await_pending_sync().await?;
         let (flushed_pos, presync_pos) = {
             let state = self.state.borrow();
             (state.flushed_pos(), state.synced_pos)
@@ -1264,6 +1294,117 @@ impl DmaStreamWriter {
     pub async fn sync(&self) -> Result<u64> {
         self.flush_inner(true).await?;
         self.sync_inner().await
+    }
+
+    async fn await_pending_sync(&self) -> Result<()> {
+        let handle = self.state.borrow_mut().pending_sync.take();
+        if let Some(h) = handle {
+            h.await;
+        }
+        let mut state = self.state.borrow_mut();
+        if let Some(err) = current_error!(state) {
+            return err;
+        }
+        Ok(())
+    }
+
+    /// Flushes all buffers (including the current partial buffer) and initiates
+    /// an `fdatasync` in the background, returning immediately so that writes
+    /// can continue while the sync completes.
+    ///
+    /// Returns the position that will be durably synced once the background
+    /// operation finishes. Use [`current_synced_pos`] to check whether the
+    /// background sync has completed.
+    ///
+    /// Only one background sync can be in-flight at a time. If a previous
+    /// background sync is still running, this method will await its completion
+    /// before starting a new one.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use futures::io::AsyncWriteExt;
+    /// use glommio::{
+    ///     io::{DmaFile, DmaStreamWriterBuilder},
+    ///     LocalExecutor,
+    /// };
+    ///
+    /// let ex = LocalExecutor::default();
+    /// ex.run(async {
+    ///     let file = DmaFile::create("myfile.txt").await.unwrap();
+    ///     let mut writer = DmaStreamWriterBuilder::new(file)
+    ///         .with_buffer_size(4096)
+    ///         .with_write_behind(2)
+    ///         .build();
+    ///     let buf = [0u8; 5000];
+    ///     writer.write_all(&buf).await.unwrap();
+    ///     // Start syncing in the background
+    ///     let sync_pos = writer.sync_background().await.unwrap();
+    ///     // Writes can continue immediately while fdatasync runs
+    ///     writer.write_all(&buf).await.unwrap();
+    ///     writer.close().await.unwrap();
+    /// });
+    /// ```
+    ///
+    /// [`current_synced_pos`]: Self::current_synced_pos
+    pub async fn sync_background(&self) -> Result<u64> {
+        self.await_pending_sync().await?;
+        let flushed_pos = self.flush_inner(true).await?;
+
+        {
+            let state = self.state.borrow();
+            if state.synced_pos >= flushed_pos {
+                return Ok(flushed_pos);
+            }
+        }
+
+        let file = self.file.borrow().clone().unwrap();
+        let state_rc = self.state.clone();
+        let handle = crate::spawn_local(async move {
+            let res = file.fdatasync().await;
+            let mut state = state_rc.borrow_mut();
+            if !collect_error!(state, res) {
+                state.synced_pos = flushed_pos;
+            }
+            state.pending_sync = None;
+        })
+        .detach();
+        self.state.borrow_mut().pending_sync = Some(handle);
+
+        Ok(flushed_pos)
+    }
+
+    /// Like [`sync_background`], but only flushes fully aligned buffers,
+    /// leaving the current partial buffer untouched.
+    ///
+    /// Returns the aligned position that will be durably synced once the
+    /// background operation finishes.
+    ///
+    /// [`sync_background`]: Self::sync_background
+    pub async fn sync_aligned_background(&self) -> Result<u64> {
+        self.await_pending_sync().await?;
+        let flushed_pos = self.flush_inner(false).await?;
+
+        {
+            let state = self.state.borrow();
+            if state.synced_pos >= flushed_pos {
+                return Ok(flushed_pos);
+            }
+        }
+
+        let file = self.file.borrow().clone().unwrap();
+        let state_rc = self.state.clone();
+        let handle = crate::spawn_local(async move {
+            let res = file.fdatasync().await;
+            let mut state = state_rc.borrow_mut();
+            if !collect_error!(state, res) {
+                state.synced_pos = flushed_pos;
+            }
+            state.pending_sync = None;
+        })
+        .detach();
+        self.state.borrow_mut().pending_sync = Some(handle);
+
+        Ok(flushed_pos)
     }
 
     // internal function that does everything that close does (flushes buffers, etc,
@@ -2215,5 +2356,107 @@ mod test {
             assert_eq!(writer.current_flushed_pos(), 5000);
             assert_eq!(file_size(&filename), 5000);
         }
+    });
+
+    file_stream_write_test!(sync_background_basic, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_write_behind(2)
+            .build();
+
+        let buffer = [0u8; 5000];
+        writer.write_all(&buffer).await.unwrap();
+        let sync_pos = writer.sync_background().await.unwrap();
+        assert_eq!(sync_pos, 5000);
+
+        // synced_pos may not be updated yet (background task hasn't run)
+        // Yield to let the background fdatasync task complete
+        futures_lite::future::yield_now().await;
+        futures_lite::future::yield_now().await;
+        assert_eq!(writer.current_synced_pos(), 5000);
+
+        writer.close().await.unwrap();
+    });
+
+    file_stream_write_test!(sync_background_allows_writes, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_write_behind(2)
+            .build();
+
+        let buffer = [0u8; 5000];
+        writer.write_all(&buffer).await.unwrap();
+        let sync_pos = writer.sync_background().await.unwrap();
+        assert_eq!(sync_pos, 5000);
+
+        // Writes should proceed immediately while fdatasync runs in background
+        writer.write_all(&buffer).await.unwrap();
+        assert_eq!(writer.current_pos(), 10000);
+
+        writer.close().await.unwrap();
+        assert_eq!(writer.current_flushed_pos(), 10000);
+        assert_eq!(file_size(&filename), 10000);
+    });
+
+    file_stream_write_test!(
+        sync_background_then_blocking_sync,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let mut writer = DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .with_write_behind(2)
+                .build();
+
+            let buffer = [0u8; 5000];
+            writer.write_all(&buffer).await.unwrap();
+            writer.sync_background().await.unwrap();
+
+            // Write more data
+            writer.write_all(&buffer).await.unwrap();
+
+            // Blocking sync should wait for background sync, then sync new data
+            let synced = writer.sync().await.unwrap();
+            assert_eq!(synced, 10000);
+            assert_eq!(writer.current_synced_pos(), 10000);
+
+            writer.close().await.unwrap();
+        }
+    );
+
+    file_stream_write_test!(sync_background_then_close, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_write_behind(2)
+            .build();
+
+        let buffer = [0u8; 5000];
+        writer.write_all(&buffer).await.unwrap();
+        writer.sync_background().await.unwrap();
+
+        // Close should wait for background sync and complete cleanly
+        writer.close().await.unwrap();
+        assert_eq!(writer.current_flushed_pos(), 5000);
+        assert_eq!(file_size(&filename), 5000);
+    });
+
+    file_stream_write_test!(sync_aligned_background_basic, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_write_behind(2)
+            .build();
+
+        let buffer = [0u8; 5000];
+        writer.write_all(&buffer).await.unwrap();
+        // Only aligned data (4096) should be synced, not partial buffer
+        let sync_pos = writer.sync_aligned_background().await.unwrap();
+        assert_eq!(sync_pos, 4096);
+
+        // Can still write
+        writer.write_all(&buffer).await.unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(file_size(&filename), 10000);
     });
 }
