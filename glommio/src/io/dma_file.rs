@@ -387,6 +387,10 @@ impl DmaFile {
     /// [`alloc_dma_buffer`]: struct.DmaFile.html#method.alloc_dma_buffer
     /// [man page]: https://man7.org/linux/man-pages/man2/open.2.html
     pub async fn write_at(&self, buf: DmaBuffer, pos: u64) -> Result<usize> {
+        // a hook set for tests decides first, and may tear the write
+        if let Some(keep) = self.hooked_write(pos, buf.len())? {
+            return self.write_torn(buf.as_bytes(), pos, keep).await;
+        }
         let source = self.file.reactor.upgrade().unwrap().write_dma(
             self.as_raw_fd(),
             DmaSource::Owned(buf),
@@ -447,6 +451,10 @@ impl DmaFile {
     /// });
     /// ```
     pub async fn write_rc_at(&self, buf: Rc<DmaBuffer>, pos: u64) -> Result<usize> {
+        // a hook set for tests decides first, and may tear the write
+        if let Some(keep) = self.hooked_write(pos, buf.len())? {
+            return self.write_torn(buf.as_bytes(), pos, keep).await;
+        }
         let source = self.file.reactor.upgrade().unwrap().write_dma(
             self.as_raw_fd(),
             DmaSource::Shared(buf),
@@ -461,6 +469,9 @@ impl DmaFile {
     /// The position must be aligned to for Direct I/O. In most platforms
     /// that means 512 bytes.
     pub async fn read_at_aligned(&self, pos: u64, size: usize) -> Result<ReadResult> {
+        // a hook set for tests decides first
+        self.file
+            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")?;
         let source = self.file.reactor.upgrade().unwrap().read_dma(
             self.as_raw_fd(),
             pos,
@@ -481,6 +492,9 @@ impl DmaFile {
     /// If you can guarantee proper alignment, prefer [`Self::read_at_aligned`]
     /// instead
     pub async fn read_at(&self, pos: u64, size: usize) -> Result<ReadResult> {
+        // a hook set for tests decides first
+        self.file
+            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")?;
         let eff_pos = self.align_down(pos);
         let b = (pos - eff_pos) as usize;
 
@@ -587,6 +601,67 @@ impl DmaFile {
             .await;
         let copy_size = enhanced_try!(source.collect_rw().await, "Copying file range", self.file)?;
         Ok(copy_size)
+    }
+
+    /// Ask the hook set for tests about a write, returning how much of it to keep if it is torn
+    ///
+    /// # Arguments
+    ///
+    /// * `pos` - Where the write starts
+    /// * `len` - How many bytes it writes
+    fn hooked_write(&self, pos: u64, len: usize) -> Result<Option<usize>> {
+        // nothing to ask when no hook is set, which is every program but a test's
+        if !crate::io::hook::is_set() {
+            return Ok(None);
+        }
+        let path = self.file.path.borrow();
+        match crate::io::hook::check(path.as_deref(), crate::io::IoOp::Write { pos, len }) {
+            crate::io::IoVerdict::Proceed => Ok(None),
+            crate::io::IoVerdict::Tear(keep) => Ok(Some(keep)),
+            crate::io::IoVerdict::Fail(error) => Err(crate::GlommioError::create_enhanced(
+                error,
+                "Writing",
+                path.as_ref(),
+                Some(self.as_raw_fd()),
+            )),
+        }
+    }
+
+    /// Write only the start of a write, as a crash in the middle of it would leave it, and tell
+    /// the hook
+    ///
+    /// A direct write lands in whole blocks, so the start kept is rounded down to the file's
+    /// alignment; what is kept is synced before the hook hears of it.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - The whole write
+    /// * `pos` - Where it starts
+    /// * `keep` - How many of its bytes the hook asked to keep
+    async fn write_torn(&self, bytes: &[u8], pos: u64, keep: usize) -> Result<usize> {
+        // whole blocks of the start, and nothing past the write's own end
+        let keep = self.align_down(keep.min(bytes.len()) as u64) as usize;
+        if keep > 0 {
+            let mut prefix = self.alloc_dma_buffer(keep);
+            prefix.as_bytes_mut().copy_from_slice(&bytes[..keep]);
+            let source = self.file.reactor.upgrade().unwrap().write_dma(
+                self.as_raw_fd(),
+                DmaSource::Owned(prefix),
+                pos,
+                self.pollable,
+            );
+            enhanced_try!(source.collect_rw().await, "Writing", self.file)?;
+            self.file.fdatasync().await?;
+        }
+        // the hook hears what reached the device, and the write fails if it returns
+        let path = self.file.path.borrow().clone().unwrap_or_default();
+        let error = crate::io::hook::torn(&path, keep);
+        Err(crate::GlommioError::create_enhanced(
+            error,
+            "Writing",
+            Some(&path),
+            Some(self.as_raw_fd()),
+        ))
     }
 
     /// Issues `fdatasync` for the underlying file, instructing the OS to flush

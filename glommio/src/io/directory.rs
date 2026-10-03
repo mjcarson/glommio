@@ -50,6 +50,17 @@ impl Directory {
     /// Asynchronously open the directory at path
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Directory> {
         let path = path.as_ref().to_owned();
+        // a hook set for tests decides first
+        if let crate::io::IoVerdict::Fail(error) =
+            crate::io::hook::check(Some(&path), crate::io::IoOp::Open)
+        {
+            return Err(GlommioError::create_enhanced(
+                error,
+                "Opening directory",
+                Some(&path),
+                None,
+            ));
+        }
         let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
         let reactor = crate::executor().reactor();
         let source = reactor.open_at(-1, &path, flags, 0o755);
@@ -79,6 +90,17 @@ impl Directory {
     /// Similar to create() in the standard library, but returns a DMA file
     pub async fn create<P: AsRef<Path>>(path: P) -> Result<Directory> {
         let path = path.as_ref().to_owned();
+        // a hook set for tests decides first
+        if let crate::io::IoVerdict::Fail(error) =
+            crate::io::hook::check(Some(&path), crate::io::IoOp::Open)
+        {
+            return Err(GlommioError::create_enhanced(
+                error,
+                "Creating directory",
+                Some(&path),
+                None,
+            ));
+        }
         let source = crate::executor().reactor().create_dir(&*path, 0o777).await;
 
         enhanced_try!(
@@ -122,6 +144,9 @@ impl Directory {
 
     /// Issues fdatasync into the underlying file.
     pub async fn sync(&self) -> Result<()> {
+        // a hook set for tests decides first
+        self.file
+            .hooked(crate::io::IoOp::Sync, "Syncing directory")?;
         let source = self
             .file
             .reactor

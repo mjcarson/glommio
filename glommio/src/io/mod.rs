@@ -128,6 +128,7 @@ mod directory;
 mod dma_file;
 mod dma_file_stream;
 mod glommio_file;
+mod hook;
 mod immutable_file;
 mod open_options;
 mod read_result;
@@ -140,6 +141,19 @@ pub(super) type Result<T> = crate::Result<T, ()>;
 
 /// rename an existing file.
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) -> Result<()> {
+    // a hook set for tests decides first, for the name it leaves and the one it takes
+    if hook::is_set() {
+        for path in [old_path.as_ref(), new_path.as_ref()] {
+            if let hook::IoVerdict::Fail(error) = hook::check(Some(path), IoOp::Meta) {
+                return Err(crate::GlommioError::create_enhanced(
+                    error,
+                    "Renaming",
+                    Some(path),
+                    None,
+                ));
+            }
+        }
+    }
     let reactor = crate::executor().reactor();
     let source = reactor.rename(old_path.as_ref(), new_path.as_ref()).await;
     source.collect_rw().await?;
@@ -148,6 +162,15 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) ->
 
 /// remove an existing file given its name
 pub async fn remove<P: AsRef<Path>>(path: P) -> Result<()> {
+    // a hook set for tests decides first
+    if let hook::IoVerdict::Fail(error) = hook::check(Some(path.as_ref()), IoOp::Meta) {
+        return Err(crate::GlommioError::create_enhanced(
+            error,
+            "Removing",
+            Some(path.as_ref()),
+            None,
+        ));
+    }
     let reactor = crate::executor().reactor();
     let source = reactor.remove_file(path.as_ref()).await;
     source.collect_rw().await?;
@@ -168,6 +191,7 @@ pub use self::{
     dma_file_stream::{
         DmaStreamReader, DmaStreamReaderBuilder, DmaStreamWriter, DmaStreamWriterBuilder,
     },
+    hook::{set_io_hook, IoHook, IoOp, IoVerdict},
     immutable_file::{ImmutableFile, ImmutableFileBuilder, ImmutableFilePreSealSink},
     open_options::OpenOptions,
     read_result::ReadResult,

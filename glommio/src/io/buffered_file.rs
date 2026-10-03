@@ -142,7 +142,55 @@ impl BufferedFile {
     ///     file.close().await.unwrap();
     /// });
     /// ```
-    pub async fn write_at(&self, buf: Vec<u8>, pos: u64) -> Result<usize> {
+    pub async fn write_at(&self, mut buf: Vec<u8>, pos: u64) -> Result<usize> {
+        // a hook set for tests decides first, and may tear the write
+        if crate::io::hook::is_set() {
+            let path = self.file.path.borrow().clone();
+            let op = crate::io::IoOp::Write {
+                pos,
+                len: buf.len(),
+            };
+            match crate::io::hook::check(path.as_deref(), op) {
+                crate::io::IoVerdict::Proceed => {}
+                crate::io::IoVerdict::Fail(error) => {
+                    return Err(GlommioError::create_enhanced(
+                        error,
+                        "Writing",
+                        path.as_ref(),
+                        Some(self.as_raw_fd()),
+                    ));
+                }
+                crate::io::IoVerdict::Tear(keep) => {
+                    // the start of the write, made durable, and then the hook hears of it
+                    buf.truncate(keep);
+                    let kept = buf.len();
+                    if kept > 0 {
+                        let source = self.file.reactor.upgrade().unwrap().write_buffered(
+                            self.as_raw_fd(),
+                            buf,
+                            pos,
+                        );
+                        source.collect_rw().await.map_err(|source| {
+                            GlommioError::create_enhanced(
+                                source,
+                                "Writing",
+                                path.as_ref(),
+                                Some(self.as_raw_fd()),
+                            )
+                        })?;
+                        self.file.fdatasync().await?;
+                    }
+                    let path = path.unwrap_or_default();
+                    let error = crate::io::hook::torn(&path, kept);
+                    return Err(GlommioError::create_enhanced(
+                        error,
+                        "Writing",
+                        Some(&path),
+                        Some(self.as_raw_fd()),
+                    ));
+                }
+            }
+        }
         let source =
             self.file
                 .reactor
@@ -169,6 +217,9 @@ impl BufferedFile {
     /// [`DmaFile`]: struct.DmaFile.html
     /// Reads from a specific position in the file and returns the buffer.
     pub async fn read_at(&self, pos: u64, size: usize) -> Result<ReadResult> {
+        // a hook set for tests decides first
+        self.file
+            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")?;
         let source = self.file.reactor.upgrade().unwrap().read_buffered(
             self.as_raw_fd(),
             pos,
