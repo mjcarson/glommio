@@ -223,6 +223,7 @@ impl GlommioFile {
         if let crate::io::hook::IoVerdict::Fail(error) =
             crate::io::hook::check(Some(&path), crate::io::IoOp::Open)
         {
+            crate::io::hook::settle().await;
             return Err(error);
         }
         let source = reactor.open_at(dir, &path, flags, mode);
@@ -468,25 +469,29 @@ impl GlommioFile {
     /// Ask the hook set for tests about an operation on this file, failing as it says to
     ///
     /// Anything but a refusal goes ahead: a tear only means something to a write, which asks the
-    /// hook itself.
+    /// hook itself. A refusal is answered after one yield, the way a real operation's error
+    /// arrives, since a caller may rely on an operation suspending before it completes.
     ///
     /// # Arguments
     ///
     /// * `op` - What the operation is about to do
     /// * `name` - What the operation is called, for the error
-    pub(crate) fn hooked(&self, op: crate::io::IoOp, name: &'static str) -> Result<()> {
+    pub(crate) async fn hooked(&self, op: crate::io::IoOp, name: &'static str) -> Result<()> {
         // nothing to ask when no hook is set, which is every program but a test's
         if !crate::io::hook::is_set() {
             return Ok(());
         }
-        let path = self.path.borrow();
+        let path = self.path.borrow().clone();
         match crate::io::hook::check(path.as_deref(), op) {
-            crate::io::IoVerdict::Fail(error) => Err(GlommioError::create_enhanced(
-                error,
-                name,
-                path.as_ref(),
-                Some(self.as_raw_fd()),
-            )),
+            crate::io::IoVerdict::Fail(error) => {
+                crate::io::hook::settle().await;
+                Err(GlommioError::create_enhanced(
+                    error,
+                    name,
+                    path.as_ref(),
+                    Some(self.as_raw_fd()),
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -515,7 +520,7 @@ impl GlommioFile {
 
     async fn fallocate(&self, op: &'static str, flags: i32, offset: u64, size: u64) -> Result<()> {
         // a hook set for tests decides first
-        self.hooked(crate::io::IoOp::Meta, op)?;
+        self.hooked(crate::io::IoOp::Meta, op).await?;
         let source =
             self.reactor
                 .upgrade()
@@ -541,7 +546,7 @@ impl GlommioFile {
 
     pub(crate) async fn truncate(&self, size: u64) -> Result<()> {
         // a hook set for tests decides first
-        self.hooked(crate::io::IoOp::Meta, "Truncating")?;
+        self.hooked(crate::io::IoOp::Meta, "Truncating").await?;
         let source = self
             .reactor
             .upgrade()
@@ -569,7 +574,7 @@ impl GlommioFile {
 
     pub(crate) async fn fdatasync(&self) -> Result<()> {
         // a hook set for tests decides first
-        self.hooked(crate::io::IoOp::Sync, "Syncing")?;
+        self.hooked(crate::io::IoOp::Sync, "Syncing").await?;
         let source = self.reactor.upgrade().unwrap().fdatasync(self.as_raw_fd());
         source.collect_rw().await.map_err(|source| {
             GlommioError::create_enhanced(

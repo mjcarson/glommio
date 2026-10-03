@@ -117,6 +117,16 @@ pub(crate) fn check(path: Option<&Path>, op: IoOp) -> IoVerdict {
     }
 }
 
+/// Suspend once, as an operation does before its completion arrives
+///
+/// An answer from the hook is ready at once, where a real operation's error comes back from the
+/// ring after the task has suspended. A caller may rely on that - a stream writer's flush task
+/// takes the writer's state once its write returns, which is safe only because the write has
+/// suspended first - so every refusal suspends once before it is returned.
+pub(crate) async fn settle() {
+    futures_lite::future::yield_now().await;
+}
+
 /// Tell the hook a torn write's prefix is on the device, and fail the write if it returns
 ///
 /// # Arguments

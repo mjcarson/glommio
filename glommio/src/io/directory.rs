@@ -54,6 +54,7 @@ impl Directory {
         if let crate::io::IoVerdict::Fail(error) =
             crate::io::hook::check(Some(&path), crate::io::IoOp::Open)
         {
+            crate::io::hook::settle().await;
             return Err(GlommioError::create_enhanced(
                 error,
                 "Opening directory",
@@ -94,6 +95,7 @@ impl Directory {
         if let crate::io::IoVerdict::Fail(error) =
             crate::io::hook::check(Some(&path), crate::io::IoOp::Open)
         {
+            crate::io::hook::settle().await;
             return Err(GlommioError::create_enhanced(
                 error,
                 "Creating directory",
@@ -146,7 +148,8 @@ impl Directory {
     pub async fn sync(&self) -> Result<()> {
         // a hook set for tests decides first
         self.file
-            .hooked(crate::io::IoOp::Sync, "Syncing directory")?;
+            .hooked(crate::io::IoOp::Sync, "Syncing directory")
+            .await?;
         let source = self
             .file
             .reactor

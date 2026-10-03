@@ -388,7 +388,7 @@ impl DmaFile {
     /// [man page]: https://man7.org/linux/man-pages/man2/open.2.html
     pub async fn write_at(&self, buf: DmaBuffer, pos: u64) -> Result<usize> {
         // a hook set for tests decides first, and may tear the write
-        if let Some(keep) = self.hooked_write(pos, buf.len())? {
+        if let Some(keep) = self.hooked_write(pos, buf.len()).await? {
             return self.write_torn(buf.as_bytes(), pos, keep).await;
         }
         let source = self.file.reactor.upgrade().unwrap().write_dma(
@@ -452,7 +452,7 @@ impl DmaFile {
     /// ```
     pub async fn write_rc_at(&self, buf: Rc<DmaBuffer>, pos: u64) -> Result<usize> {
         // a hook set for tests decides first, and may tear the write
-        if let Some(keep) = self.hooked_write(pos, buf.len())? {
+        if let Some(keep) = self.hooked_write(pos, buf.len()).await? {
             return self.write_torn(buf.as_bytes(), pos, keep).await;
         }
         let source = self.file.reactor.upgrade().unwrap().write_dma(
@@ -471,7 +471,8 @@ impl DmaFile {
     pub async fn read_at_aligned(&self, pos: u64, size: usize) -> Result<ReadResult> {
         // a hook set for tests decides first
         self.file
-            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")?;
+            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")
+            .await?;
         let source = self.file.reactor.upgrade().unwrap().read_dma(
             self.as_raw_fd(),
             pos,
@@ -494,7 +495,8 @@ impl DmaFile {
     pub async fn read_at(&self, pos: u64, size: usize) -> Result<ReadResult> {
         // a hook set for tests decides first
         self.file
-            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")?;
+            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")
+            .await?;
         let eff_pos = self.align_down(pos);
         let b = (pos - eff_pos) as usize;
 
@@ -609,21 +611,25 @@ impl DmaFile {
     ///
     /// * `pos` - Where the write starts
     /// * `len` - How many bytes it writes
-    fn hooked_write(&self, pos: u64, len: usize) -> Result<Option<usize>> {
+    async fn hooked_write(&self, pos: u64, len: usize) -> Result<Option<usize>> {
         // nothing to ask when no hook is set, which is every program but a test's
         if !crate::io::hook::is_set() {
             return Ok(None);
         }
-        let path = self.file.path.borrow();
+        let path = self.file.path.borrow().clone();
         match crate::io::hook::check(path.as_deref(), crate::io::IoOp::Write { pos, len }) {
             crate::io::IoVerdict::Proceed => Ok(None),
             crate::io::IoVerdict::Tear(keep) => Ok(Some(keep)),
-            crate::io::IoVerdict::Fail(error) => Err(crate::GlommioError::create_enhanced(
-                error,
-                "Writing",
-                path.as_ref(),
-                Some(self.as_raw_fd()),
-            )),
+            crate::io::IoVerdict::Fail(error) => {
+                // after one yield, as a real write's error arrives
+                crate::io::hook::settle().await;
+                Err(crate::GlommioError::create_enhanced(
+                    error,
+                    "Writing",
+                    path.as_ref(),
+                    Some(self.as_raw_fd()),
+                ))
+            }
         }
     }
 
@@ -656,6 +662,7 @@ impl DmaFile {
         // the hook hears what reached the device, and the write fails if it returns
         let path = self.file.path.borrow().clone().unwrap_or_default();
         let error = crate::io::hook::torn(&path, keep);
+        crate::io::hook::settle().await;
         Err(crate::GlommioError::create_enhanced(
             error,
             "Writing",

@@ -153,6 +153,7 @@ impl BufferedFile {
             match crate::io::hook::check(path.as_deref(), op) {
                 crate::io::IoVerdict::Proceed => {}
                 crate::io::IoVerdict::Fail(error) => {
+                    crate::io::hook::settle().await;
                     return Err(GlommioError::create_enhanced(
                         error,
                         "Writing",
@@ -182,6 +183,7 @@ impl BufferedFile {
                     }
                     let path = path.unwrap_or_default();
                     let error = crate::io::hook::torn(&path, kept);
+                    crate::io::hook::settle().await;
                     return Err(GlommioError::create_enhanced(
                         error,
                         "Writing",
@@ -219,7 +221,8 @@ impl BufferedFile {
     pub async fn read_at(&self, pos: u64, size: usize) -> Result<ReadResult> {
         // a hook set for tests decides first
         self.file
-            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")?;
+            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")
+            .await?;
         let source = self.file.reactor.upgrade().unwrap().read_buffered(
             self.as_raw_fd(),
             pos,

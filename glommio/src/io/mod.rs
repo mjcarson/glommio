@@ -145,6 +145,7 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) ->
     if hook::is_set() {
         for path in [old_path.as_ref(), new_path.as_ref()] {
             if let hook::IoVerdict::Fail(error) = hook::check(Some(path), IoOp::Meta) {
+                hook::settle().await;
                 return Err(crate::GlommioError::create_enhanced(
                     error,
                     "Renaming",
@@ -164,6 +165,7 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) ->
 pub async fn remove<P: AsRef<Path>>(path: P) -> Result<()> {
     // a hook set for tests decides first
     if let hook::IoVerdict::Fail(error) = hook::check(Some(path.as_ref()), IoOp::Meta) {
+        hook::settle().await;
         return Err(crate::GlommioError::create_enhanced(
             error,
             "Removing",
