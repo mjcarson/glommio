@@ -436,6 +436,50 @@ impl FromRawFd for TcpStream {
     }
 }
 
+/// A non-buffered stream gives up its descriptor without closing it, so that another executor
+/// can adopt the connection with [`FromRawFd`]
+///
+/// This is how a connection accepted by one executor is handed to the executor that should serve
+/// it: no `dup`, so there is never a moment with two owners. A buffered stream has no such
+/// conversion, since it may hold bytes it read past what its caller asked for, and those would be
+/// lost with it. Anything the peer sent that this stream did not read stays in the socket.
+///
+/// The descriptor must be adopted on the executor that will drive it: `from_raw_fd` registers it
+/// with the reactor of the executor it runs on.
+///
+/// # Examples
+/// ```no_run
+/// use glommio::{channels::shared_channel, net::TcpListener, LocalExecutor, LocalExecutorBuilder};
+/// use std::os::unix::io::{FromRawFd, IntoRawFd};
+///
+/// let ex = LocalExecutor::default();
+/// ex.run(async move {
+///     let (sender, receiver) = shared_channel::new_bounded(1);
+///     let sender = sender.connect().await;
+///
+///     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+///     let stream = listener.accept().await.unwrap();
+///     sender.try_send(stream.into_raw_fd()).unwrap();
+///
+///     let ex1 = LocalExecutorBuilder::default()
+///         .spawn(move || async move {
+///             let receiver = receiver.connect().await;
+///             let fd = receiver.recv().await.unwrap();
+///             let _stream = unsafe { glommio::net::TcpStream::from_raw_fd(fd) };
+///         })
+///         .unwrap();
+///
+///     ex1.join().unwrap();
+/// });
+/// ```
+impl IntoRawFd for TcpStream {
+    fn into_raw_fd(self) -> RawFd {
+        // the stream is a single field, with no destructor to run around it
+        let TcpStream { stream } = self;
+        stream.into_raw_fd()
+    }
+}
+
 fn make_tcp_socket(addr: &SocketAddr) -> io::Result<Socket> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -928,6 +972,123 @@ mod tests {
         ex2.join().unwrap();
         ex3.join().unwrap();
         assert_eq!(connected.load(Ordering::Relaxed), 2);
+    }
+
+    /// A stream one executor accepted, used and gave up is adopted by another with nothing lost
+    ///
+    /// Executor A accepts and answers a ping, then leaves a read with a timeout pending and drops
+    /// it, so a timer and a poll are both armed when it gives the descriptor up. It waits until the
+    /// client's next bytes are queued unread, gives the descriptor up and sends its number to B.
+    /// B adopts the same number - no `dup` - reads the queued bytes and a 1 MiB pattern, and echoes
+    /// the pattern, which the client checks byte for byte; then the client half closes and B reads
+    /// the end of the stream.
+    #[test]
+    fn tcp_stream_into_raw_fd_moves_to_another_executor() {
+        // the pattern the client sends and B echoes
+        let pattern: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+        let expected = pattern.clone();
+        let (fd_sender, fd_receiver) = shared_channel::new_bounded(1);
+        let (addr_sender, addr_receiver) = shared_channel::new_bounded(1);
+        let (done_sender, done_receiver) = shared_channel::new_bounded(1);
+        let adopted = Arc::new(AtomicUsize::new(0));
+
+        // A accepts, uses the stream, and gives it up
+        let ex_a = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let fd_sender = fd_sender.connect().await;
+                let addr_sender = addr_sender.connect().await;
+                let done_receiver = done_receiver.connect().await;
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                addr_sender
+                    .try_send(listener.local_addr().unwrap())
+                    .unwrap();
+                let mut stream = listener.accept().await.unwrap();
+                // a round trip on this executor first
+                let mut ping = [0u8; 4];
+                stream.read_exact(&mut ping).await.unwrap();
+                assert_eq!(&ping, b"ping");
+                stream.write_all(b"pong").await.unwrap();
+                // a read with a timeout, left pending and dropped: a timer and a poll are armed
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut scratch = [0u8; 4];
+                let raced = futures_lite::future::or(
+                    async { Some(stream.read(&mut scratch).await) },
+                    async {
+                        Timer::new(Duration::from_millis(20)).await;
+                        None
+                    },
+                )
+                .await;
+                assert!(
+                    raced.is_none(),
+                    "the client sends nothing until it is told to"
+                );
+                // the client's next bytes are queued and unread when the descriptor is given up
+                let mut next = [0u8; 4];
+                while stream.peek(&mut next).await.unwrap() < next.len() {
+                    Timer::new(Duration::from_millis(1)).await;
+                }
+                let fd = stream.as_raw_fd();
+                let given = stream.into_raw_fd();
+                assert_eq!(given, fd, "the descriptor leaves as it was");
+                fd_sender.try_send(given).unwrap();
+                // this executor keeps running until the client is done
+                done_receiver.recv().await.unwrap();
+            })
+            .unwrap();
+
+        // B adopts the descriptor and serves the connection from then on
+        let status = adopted.clone();
+        let ex_b = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let fd_receiver = fd_receiver.connect().await;
+                let fd = fd_receiver.recv().await.unwrap();
+                let mut stream = unsafe { TcpStream::from_raw_fd(fd) };
+                assert_eq!(stream.as_raw_fd(), fd, "no duplicate was made");
+                // the bytes A left unread
+                let mut next = [0u8; 4];
+                stream.read_exact(&mut next).await.unwrap();
+                assert_eq!(&next, b"next");
+                // the pattern, echoed back
+                let mut body = vec![0u8; 1 << 20];
+                stream.read_exact(&mut body).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+                // and the end of the stream once the client half closes
+                let mut end = [0u8; 1];
+                assert_eq!(stream.read(&mut end).await.unwrap(), 0);
+                status.store(1, Ordering::Relaxed);
+            })
+            .unwrap();
+
+        // the client, which talks to whichever executor holds the connection
+        let ex_c = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let addr_receiver = addr_receiver.connect().await;
+                let done_sender = done_sender.connect().await;
+                let addr = addr_receiver.recv().await.unwrap();
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                stream.write_all(b"ping").await.unwrap();
+                let mut pong = [0u8; 4];
+                stream.read_exact(&mut pong).await.unwrap();
+                assert_eq!(&pong, b"pong");
+                // long enough for A's pending read to have been dropped
+                Timer::new(Duration::from_millis(100)).await;
+                stream.write_all(b"next").await.unwrap();
+                stream.write_all(&pattern).await.unwrap();
+                let mut echoed = vec![0u8; 1 << 20];
+                stream.read_exact(&mut echoed).await.unwrap();
+                assert!(echoed == expected, "every byte came back as it was sent");
+                stream.shutdown(Shutdown::Write).await.unwrap();
+                done_sender.try_send(()).unwrap();
+            })
+            .unwrap();
+
+        ex_a.join().unwrap();
+        ex_b.join().unwrap();
+        ex_c.join().unwrap();
+        assert_eq!(adopted.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
     cell::Cell,
     io,
     net::Shutdown,
-    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     rc::{Rc, Weak},
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -391,6 +391,40 @@ where
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         let socket = socket2::Socket::from_raw_fd(fd);
         GlommioStream::from(socket)
+    }
+}
+
+impl<S> IntoRawFd for GlommioStream<S, NonBuffered>
+where
+    S: AsRawFd + IntoRawFd,
+{
+    /// Give up the descriptor without closing it, so another executor can adopt it
+    ///
+    /// Nothing this executor holds outlives the call: both timers are taken off the reactor and
+    /// both sources dropped, which cancels a poll still in flight by its request's identity and
+    /// never by the descriptor. A poll consumes no bytes, so whatever the peer sent and nobody
+    /// read is still in the socket for whoever adopts it.
+    fn into_raw_fd(self) -> RawFd {
+        // take the stream apart: neither it nor its inner half has a destructor of its own
+        let GlommioStream { stream, .. } = self;
+        let NonBufferedStream {
+            reactor,
+            stream,
+            source_tx,
+            source_rx,
+            write_timeout,
+            read_timeout,
+        } = stream;
+        // a timer armed by a pending operation would otherwise wait in the reactor until it fired
+        if let Some(reactor) = reactor.upgrade() {
+            write_timeout.cancel_timer(&reactor);
+            read_timeout.cancel_timer(&reactor);
+        }
+        // a source dropped while dispatched queues a cancel of its request, not of the descriptor
+        drop(source_tx);
+        drop(source_rx);
+        // and the descriptor itself leaves without being closed
+        stream.into_raw_fd()
     }
 }
 
