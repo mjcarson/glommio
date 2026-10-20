@@ -505,7 +505,7 @@ impl GlommioFile {
 
     pub(crate) async fn deallocate(&self, offset: u64, size: u64) -> Result<()> {
         let flags = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-        self.fallocate("Deallocate range", flags, offset, size)
+        self.fallocate(crate::io::IoOp::Meta, "Deallocate range", flags, offset, size)
             .await
     }
 
@@ -515,12 +515,21 @@ impl GlommioFile {
         } else {
             0
         };
-        self.fallocate("Pre-allocate space", flags, 0, size).await
+        // an allocation is asked of a hook as the blocks it takes, so a full disk can refuse it
+        let hooked = crate::io::IoOp::Allocate { pos: 0, len: size };
+        self.fallocate(hooked, "Pre-allocate space", flags, 0, size).await
     }
 
-    async fn fallocate(&self, op: &'static str, flags: i32, offset: u64, size: u64) -> Result<()> {
+    async fn fallocate(
+        &self,
+        hooked: crate::io::IoOp,
+        op: &'static str,
+        flags: i32,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
         // a hook set for tests decides first
-        self.hooked(crate::io::IoOp::Meta, op).await?;
+        self.hooked(hooked, op).await?;
         let source =
             self.reactor
                 .upgrade()

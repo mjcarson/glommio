@@ -40,7 +40,15 @@ pub enum IoOp {
     },
     /// Flush a file's or a directory's writes to the device
     Sync,
-    /// Rename, remove, truncate or allocate: a change to what names or holds the bytes, rather
+    /// Allocate a file's blocks ahead of its writes: what a full device refuses as it would a
+    /// write that grows the file, since the writes after it grow nothing
+    Allocate {
+        /// Where the allocation starts
+        pos: u64,
+        /// How many bytes it allocates
+        len: u64,
+    },
+    /// Rename, remove, truncate or punch a hole: a change to what names or holds the bytes, rather
     /// than to the bytes
     Meta,
 }
