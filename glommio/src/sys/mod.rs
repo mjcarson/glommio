@@ -89,6 +89,30 @@ pub(crate) fn send_syscall(fd: RawFd, buf: *const u8, len: usize, flags: i32) ->
     syscall!(send(fd, buf as _, len, flags)).map(|x| x as usize)
 }
 
+/// The most buffers one `sendmsg` takes: Linux's `UIO_MAXIOV`
+pub(crate) const MAX_IOVECS: usize = 1024;
+
+/// Send several buffers as one message on a connected socket, as `sendmsg` with no address does:
+/// at most [`MAX_IOVECS`] of them, the rest left for the next call
+///
+/// # Arguments
+///
+/// * `fd` - The socket
+/// * `bufs` - The buffers, in order
+/// * `flags` - The send's flags
+pub(crate) fn sendmsg_vectored_syscall(
+    fd: RawFd,
+    bufs: &[io::IoSlice<'_>],
+    flags: i32,
+) -> io::Result<usize> {
+    // an IoSlice is an iovec, so the buffers are the message's vector as they are
+    // SAFETY: a zeroed msghdr is one with no address, no control data and no vector
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = bufs.as_ptr() as *mut libc::iovec;
+    message.msg_iovlen = bufs.len().min(MAX_IOVECS) as _;
+    syscall!(sendmsg(fd, &message, flags)).map(|x| x as usize)
+}
+
 pub(crate) fn recv_syscall(fd: RawFd, buf: *mut u8, len: usize, flags: i32) -> io::Result<usize> {
     syscall!(recv(fd, buf as _, len, flags)).map(|x| x as usize)
 }

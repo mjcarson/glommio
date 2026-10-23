@@ -437,6 +437,15 @@ impl<B: RxBuf + Unpin> AsyncWrite for UnixStream<B> {
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
+    /// Every buffer in one `sendmsg`, where the default wrote the first non-empty one alone
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_flush(cx)
     }
@@ -828,4 +837,19 @@ mod tests {
         let p2 = UnixDatagram::unbound().unwrap();
         p2.connect(&file).await.unwrap();
     });
+
+    /// A Unix stream's vectored write sends its parts in order, more than the first in one call
+    #[test]
+    fn a_unix_vectored_write_sends_its_parts_in_order() {
+        test_executor!(async move {
+            let (mut p1, mut p2) = UnixStream::pair().unwrap();
+            let parts: [&[u8]; 3] = [b"one", b"two", b"three"];
+            let slices: Vec<std::io::IoSlice<'_>> = parts.iter().map(|part| std::io::IoSlice::new(part)).collect();
+            let n = p1.write_vectored(&slices).await.unwrap();
+            assert_eq!(n, 11, "a socket with room took every part in one call");
+            let mut got = [0u8; 11];
+            p2.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"onetwothree");
+        });
+    }
 }

@@ -815,6 +815,15 @@ impl<B: RxBuf + Unpin> AsyncWrite for TcpStream<B> {
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
+    /// Every buffer in one `sendmsg`, where the default wrote the first non-empty one alone
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_flush(cx)
     }
@@ -1490,6 +1499,109 @@ mod tests {
 
             let s = TcpStream::connect(addr).await.unwrap();
             assert_eq!(s.local_addr().unwrap(), peer_addr.await);
+        });
+    }
+
+    /// Write every part with vectored writes, as a peer frame is written, and the bytes each call
+    /// took
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - The stream
+    /// * `parts` - The parts, in order
+    async fn write_all_vectored(stream: &mut TcpStream, parts: &[&[u8]]) -> Vec<usize> {
+        let mut slices: Vec<io::IoSlice<'_>> = parts.iter().map(|part| io::IoSlice::new(part)).collect();
+        let mut bufs = &mut slices[..];
+        let mut calls = Vec::new();
+        // until every byte of every part is the socket's
+        while !bufs.is_empty() {
+            let n = stream.write_vectored(bufs).await.unwrap();
+            assert!(n > 0, "a vectored write took nothing");
+            calls.push(n);
+            io::IoSlice::advance_slices(&mut bufs, n);
+        }
+        calls
+    }
+
+    /// A vectored write sends its parts in order, and a socket with room takes more than the first
+    /// in one call, where the default wrote the first non-empty part alone
+    #[test]
+    fn a_vectored_write_sends_its_parts_in_order() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let middle: Vec<u8> = (0..70_000u32).map(|at| (at % 251) as u8).collect();
+            let mut expected = b"abc".to_vec();
+            expected.extend_from_slice(&middle);
+            expected.extend_from_slice(b"tail");
+            let total = expected.len();
+            let reader = crate::spawn_local(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut got = vec![0u8; total];
+                stream.read_exact(&mut got).await.unwrap();
+                got
+            });
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let calls = write_all_vectored(&mut stream, &[b"abc", &middle, b"tail"]).await;
+            assert!(calls[0] > 3, "the first call wrote its first part alone: {calls:?}");
+            assert!(reader.await == expected, "the parts arrived out of order or changed");
+        });
+    }
+
+    /// A vectored write of more than the socket holds waits for room as a write of one buffer
+    /// does, and every byte arrives in order behind a reader that reads slowly
+    #[test]
+    fn a_vectored_write_waits_for_a_slow_reader() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            // three parts of 3 MiB, each its own pattern
+            let parts: Vec<Vec<u8>> = (0..3u8)
+                .map(|part| (0..3u32 << 20).map(|at| (at as u8).wrapping_mul(7).wrapping_add(part)).collect())
+                .collect();
+            let expected: Vec<u8> = parts.concat();
+            let total = expected.len();
+            let reader = crate::spawn_local(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut got = Vec::with_capacity(total);
+                let mut buf = vec![0u8; 256 << 10];
+                while got.len() < total {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "the stream ended early");
+                    got.extend_from_slice(&buf[..n]);
+                    // slowly, so the writer finds the socket full
+                    Timer::new(Duration::from_millis(2)).await;
+                }
+                got
+            });
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            let calls = write_all_vectored(&mut stream, &refs).await;
+            assert!(calls.len() > 1, "9 MiB went in one call, so the socket was never full");
+            assert!(reader.await == expected, "the bytes arrived out of order or changed");
+        });
+    }
+
+    /// A vectored write of more parts than one `sendmsg` takes sends them over several calls, each
+    /// of at most the kernel's vector, in order
+    #[test]
+    fn a_vectored_write_takes_more_parts_than_one_call() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let expected: Vec<u8> = (0..2_000u32).map(|at| (at % 256) as u8).collect();
+            let reader = crate::spawn_local(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut got = vec![0u8; 2_000];
+                stream.read_exact(&mut got).await.unwrap();
+                got
+            });
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let parts: Vec<&[u8]> = expected.chunks(1).collect();
+            let calls = write_all_vectored(&mut stream, &parts).await;
+            assert!(calls.iter().all(|n| *n <= crate::sys::MAX_IOVECS), "{calls:?}");
+            assert!(calls.len() >= 2, "2,000 parts went in one call: {calls:?}");
+            assert_eq!(reader.await, expected);
         });
     }
 }

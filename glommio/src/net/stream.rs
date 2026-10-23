@@ -330,6 +330,46 @@ impl<S: AsRawFd> NonBufferedStream<S> {
         Poll::Pending
     }
 
+    /// Write several buffers as one message, or wait for room as a write of one buffer does
+    ///
+    /// One `sendmsg` sends as much of them as the socket takes now, so a frame's parts leave in
+    /// one call, and under kTLS fill records across their boundaries, where a write of each part
+    /// was a call, and a record, of its own.
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - The task's context
+    /// * `bufs` - The buffers, in order
+    pub(crate) fn poll_write_vectored(
+        &mut self,
+        cx: &Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        // as a write of one buffer does: try first, since a socket with room takes it at once
+        if let Some(result) = super::yolo_send_vectored(self.stream.as_raw_fd(), bufs) {
+            let reactor = self.reactor.upgrade().unwrap();
+            self.write_timeout.cancel_timer(reactor.as_ref());
+            self.source_tx.take();
+            return Poll::Ready(result);
+        }
+        // and then wait for room, under the write's timeout
+        let reactor = self.reactor.upgrade().unwrap();
+        let reactor = reactor.as_ref();
+        poll_err!(self.write_timeout.check(reactor));
+        let no_pending_poll = self
+            .source_tx
+            .as_ref()
+            .map(|src| src.result().is_some())
+            .unwrap_or(true);
+        if no_pending_poll {
+            self.source_tx = Some(reactor.poll_write_ready(self.stream.as_raw_fd()));
+        }
+        let source = self.source_tx.as_ref().unwrap();
+        source.add_waiter_single(cx.waker());
+        self.write_timeout.maybe_set_timer(reactor, cx.waker());
+        Poll::Pending
+    }
+
     pub(crate) fn poll_close(&mut self, _: &Context<'_>) -> Poll<io::Result<()>> {
         self.source_tx.take();
         Poll::Ready(sys::shutdown(self.stream.as_raw_fd(), Shutdown::Write))
@@ -493,6 +533,20 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
 
     pub(crate) fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.stream.poll_write(cx, buf)
+    }
+
+    /// Write several buffers as one message
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - The task's context
+    /// * `bufs` - The buffers, in order
+    pub(crate) fn poll_write_vectored(
+        &mut self,
+        cx: &Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.stream.poll_write_vectored(cx, bufs)
     }
 
     pub(crate) fn poll_flush(&self, _cx: &Context<'_>) -> Poll<io::Result<()>> {

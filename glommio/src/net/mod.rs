@@ -43,6 +43,22 @@ fn yolo_send(fd: RawFd, buf: &[u8]) -> Option<io::Result<usize>> {
     }
 }
 
+/// Send several buffers in one non-blocking call, or nothing if the socket has no room now
+///
+/// # Arguments
+///
+/// * `fd` - The socket
+/// * `bufs` - The buffers, in order
+fn yolo_send_vectored(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> Option<io::Result<usize>> {
+    match sys::sendmsg_vectored_syscall(fd, bufs, MsgFlags::MSG_DONTWAIT.bits()) {
+        Ok(x) => Some(Ok(x)),
+        Err(err) => match err.kind() {
+            io::ErrorKind::WouldBlock => None,
+            _ => Some(Err(err)),
+        },
+    }
+}
+
 fn yolo_peek(fd: RawFd, buf: &mut [u8]) -> Option<io::Result<usize>> {
     match sys::recv_syscall(
         fd,
