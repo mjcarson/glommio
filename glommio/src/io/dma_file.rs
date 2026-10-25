@@ -14,7 +14,7 @@ use crate::{
         read_result::ReadResult,
         ScheduledSource,
     },
-    sys::{self, sysfs, DirectIo, DmaBuffer, DmaSource, PollableStatus},
+    sys::{self, sysfs, DirectIo, DmaBuffer, DmaSource, OwnedDmaBuffer, PollableStatus},
 };
 use futures_lite::{Stream, StreamExt};
 use nix::sys::statfs::*;
@@ -482,6 +482,43 @@ impl DmaFile {
         );
         let read_size = enhanced_try!(source.collect_rw().await, "Reading", self.file)?;
         Ok(ReadResult::from_sliced_buffer(source, 0, read_size))
+    }
+
+    /// Reads from a specific position in the file into a caller's buffer, and gives it back cut to
+    /// what was read.
+    ///
+    /// The position and the buffer's length must be aligned for Direct I/O, as
+    /// [`Self::read_at_aligned`]'s are. Unlike it, the read is never shared with another of an
+    /// overlapping range, and the buffer is heap memory the caller may send to another thread
+    /// once it is filled, where a read's own buffer may be registered with this executor's ring.
+    /// A future dropped while the read is in flight leaves the buffer alive until the kernel is
+    /// done with it, then frees it. A short read, at the file's end, gives the buffer back
+    /// shorter.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer to read into, as long as the read
+    /// * `pos` - Where in the file to read from
+    pub async fn read_into_at(&self, buf: OwnedDmaBuffer, pos: u64) -> Result<OwnedDmaBuffer> {
+        let size = buf.len();
+        // a hook set for tests decides first
+        self.file
+            .hooked(crate::io::IoOp::Read { pos, len: size }, "Reading")
+            .await?;
+        let source = self.file.reactor.upgrade().unwrap().read_into(
+            self.as_raw_fd(),
+            pos,
+            buf.into_inner(),
+            self.pollable,
+        );
+        let read_size = enhanced_try!(source.collect_rw().await, "Reading", self.file)?;
+        // the buffer back from its source, cut to what the read returned
+        let mut buffer = match source.extract_buffer() {
+            sys::IoBuffer::DmaSink(buffer) => buffer,
+            _ => unreachable!("a read into a caller's buffer gives it back"),
+        };
+        buffer.trim_to_size(read_size.min(size));
+        Ok(OwnedDmaBuffer::from_heap(buffer))
     }
 
     /// Reads into buffer in buf from a specific position in the file.
@@ -1290,6 +1327,85 @@ pub(crate) mod test {
             }
         };
     }
+
+    /// A file of `blocks` blocks of the file's alignment, each block's bytes its index
+    async fn blocks_file(path: &Path, blocks: usize) -> (DmaFile, usize) {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .dma_open(path)
+            .await
+            .expect("failed to create file");
+        let align = file.alignment() as usize;
+        let mut buf = file.alloc_dma_buffer(align * blocks);
+        for (index, block) in buf.as_bytes_mut().chunks_mut(align).enumerate() {
+            block.fill(index as u8 + 1);
+        }
+        assert_eq!(file.write_at(buf, 0).await.unwrap(), align * blocks);
+        (file, align)
+    }
+
+    dma_file_test!(a_buffer_read_into_crosses_to_another_thread, path, _k, {
+        let (file, align) = blocks_file(&path.join("testfile"), 4).await;
+        // two blocks from the second, into a buffer of the heap's
+        let buf = OwnedDmaBuffer::new(align * 2).expect("a buffer");
+        let read = file.read_into_at(buf, align as u64).await.unwrap();
+        assert_eq!(read.len(), align * 2);
+        // read and dropped on a thread that is no executor's
+        let checked = std::thread::spawn(move || {
+            let blocks: Vec<u8> = read.as_bytes().chunks(align).map(|block| block[0]).collect();
+            let whole = read
+                .as_bytes()
+                .chunks(align)
+                .all(|block| block.iter().all(|byte| *byte == block[0]));
+            drop(read);
+            (blocks, whole)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(checked, (vec![2, 3], true));
+        file.close().await.unwrap();
+    });
+
+    dma_file_test!(a_short_read_into_a_buffer_is_cut_to_it, path, _k, {
+        let (file, align) = blocks_file(&path.join("testfile"), 2).await;
+        // four blocks asked from the second of two: one comes back
+        let buf = OwnedDmaBuffer::new(align * 4).expect("a buffer");
+        let read = file.read_into_at(buf, align as u64).await.unwrap();
+        assert_eq!(read.len(), align);
+        assert!(read.as_bytes().iter().all(|byte| *byte == 2));
+        // and from past the end, none
+        let buf = OwnedDmaBuffer::new(align).expect("a buffer");
+        assert!(file.read_into_at(buf, (align * 8) as u64).await.unwrap().is_empty());
+        file.close().await.unwrap();
+    });
+
+    dma_file_test!(a_read_into_a_buffer_outlives_its_dropped_future, path, _k, {
+        let (file, align) = blocks_file(&path.join("testfile"), 64).await;
+        let file = Rc::new(file);
+        // reads begun and dropped at every point: before they are submitted, and once the reactor
+        // has had a turn to submit them
+        for turn in 0..16 {
+            let buf = OwnedDmaBuffer::new(align * 64).expect("a buffer");
+            let mut read = Box::pin(file.read_into_at(buf, 0));
+            assert!(futures_lite::future::poll_once(&mut read).await.is_none(), "a read waits on its completion");
+            if turn % 2 == 1 {
+                sleep(Duration::from_micros(50 * turn)).await;
+            }
+            drop(read);
+        }
+        // the file and the reactor are as they were: a read after them finds every byte
+        let buf = OwnedDmaBuffer::new(align * 64).expect("a buffer");
+        let read = file.read_into_at(buf, 0).await.unwrap();
+        assert_eq!(read.len(), align * 64);
+        assert!(read
+            .as_bytes()
+            .chunks(align)
+            .enumerate()
+            .all(|(index, block)| block.iter().all(|byte| *byte == index as u8 + 1)));
+        Rc::try_unwrap(file).ok().unwrap().close().await.unwrap();
+    });
 
     dma_file_test!(file_create_close, path, _k, {
         let new_file = DmaFile::create(path.join("testfile"))

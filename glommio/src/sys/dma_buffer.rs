@@ -111,6 +111,11 @@ impl DmaBuffer {
         }
     }
 
+    /// Whether its storage is an allocation of its own from the heap, which no executor holds
+    pub(crate) fn is_heap(&self) -> bool {
+        matches!(self.storage, BufferStorage::Sys(_))
+    }
+
     pub(crate) fn uring_buffer_id(&self) -> Option<u32> {
         match &self.storage {
             BufferStorage::Uring(x) => x.uring_buffer_id(),
@@ -172,6 +177,89 @@ impl AsRef<[u8]> for DmaBuffer {
 }
 
 impl AsMut<[u8]> for DmaBuffer {
+    #[inline(always)]
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_bytes_mut()
+    }
+}
+
+/// A buffer suitable for Direct I/O that may be sent to another thread
+///
+/// A [`DmaBuffer`] may hold memory registered with its executor's ring, or a read's result shared
+/// within the executor, and neither may leave that thread. This one is always memory of its own,
+/// from the heap, aligned for Direct I/O: a read fills it with
+/// [`DmaFile::read_into_at`](crate::io::DmaFile::read_into_at), and whoever holds it may then hand
+/// it to any thread, which frees it as it would a `Vec`. A read into it cannot use the ring's
+/// registered buffers.
+#[derive(Debug)]
+pub struct OwnedDmaBuffer {
+    /// The buffer, its storage always the heap's
+    buffer: DmaBuffer,
+}
+
+// SAFETY: the buffer's storage is always `BufferStorage::Sys`, an allocation of the global
+// allocator that only this value refers to and that `SysAlloc`'s drop frees with the same layout,
+// on whichever thread drops it. It holds no registered memory, no shared read result and no pointer
+// into its executor, which are what keep a `DmaBuffer` on its thread.
+unsafe impl Send for OwnedDmaBuffer {}
+
+impl OwnedDmaBuffer {
+    /// A buffer of `size` bytes from the heap, aligned for Direct I/O, or none for a size of zero
+    /// or an allocation that failed
+    ///
+    /// Its bytes are not set until a read fills them.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - How many bytes it holds
+    pub fn new(size: usize) -> Option<Self> {
+        DmaBuffer::new(size).map(|buffer| OwnedDmaBuffer { buffer })
+    }
+
+    /// The buffer of a read that filled it, cut to what the read returned
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer` - A buffer of heap memory, as [`OwnedDmaBuffer::into_inner`] gave it
+    pub(crate) fn from_heap(buffer: DmaBuffer) -> Self {
+        debug_assert!(buffer.is_heap(), "an owned buffer is the heap's");
+        OwnedDmaBuffer { buffer }
+    }
+
+    /// The buffer, for a read on its executor to fill
+    pub(crate) fn into_inner(self) -> DmaBuffer {
+        self.buffer
+    }
+
+    /// How many bytes it holds
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Whether it holds none: a read that found the file ended where it began
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Its bytes
+    pub fn as_bytes(&self) -> &[u8] {
+        self.buffer.as_bytes()
+    }
+
+    /// Its bytes, to change
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_bytes_mut()
+    }
+}
+
+impl AsRef<[u8]> for OwnedDmaBuffer {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl AsMut<[u8]> for OwnedDmaBuffer {
     #[inline(always)]
     fn as_mut(&mut self) -> &mut [u8] {
         self.as_bytes_mut()

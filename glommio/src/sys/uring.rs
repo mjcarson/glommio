@@ -65,6 +65,7 @@ enum UringOpDescriptor {
     Write(*const u8, usize, u64),
     WriteFixed(*const u8, usize, u64, u32),
     ReadFixed(u64, usize),
+    ReadInto(u64, usize),
     Read(u64, usize),
     Open(*const u8, libc::c_int, u32),
     Close,
@@ -373,6 +374,20 @@ fn fill_sqe<F>(
                             *slot = Some(IoBuffer::DmaSink(buf));
                         }
                         _ => unreachable!(),
+                    };
+                });
+            }
+
+            UringOpDescriptor::ReadInto(pos, len) => {
+                // the caller's buffer, held by its source until the completion is consumed, so a
+                // future dropped while the kernel writes into it leaves it alive
+                source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
+                    match &mut src.source_type {
+                        SourceType::Read(_, Some(IoBuffer::DmaSink(buf))) => {
+                            let len = len.min(buf.len());
+                            sqe.prep_read(op.fd, &mut buf.as_bytes_mut()[..len], pos);
+                        }
+                        _ => unreachable!("a read into a caller's buffer holds it"),
                     };
                 });
             }
@@ -1425,6 +1440,16 @@ impl Reactor {
 
     pub(crate) fn read_dma(&self, source: &Source, pos: u64, size: usize) {
         let op = UringOpDescriptor::ReadFixed(pos, size);
+        queue_request_into_ring(
+            &mut *self.ring_for_source(source),
+            source,
+            op,
+            &mut self.source_map.borrow_mut(),
+        );
+    }
+
+    pub(crate) fn read_into(&self, source: &Source, pos: u64, size: usize) {
+        let op = UringOpDescriptor::ReadInto(pos, size);
         queue_request_into_ring(
             &mut *self.ring_for_source(source),
             source,

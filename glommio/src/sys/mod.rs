@@ -202,7 +202,7 @@ pub(crate) mod source;
 pub(crate) mod sysfs;
 mod uring;
 
-pub use self::dma_buffer::DmaBuffer;
+pub use self::dma_buffer::{DmaBuffer, OwnedDmaBuffer};
 pub(crate) use self::{source::*, uring::*};
 use crate::error::{ExecutorErrorKind, GlommioError};
 use smallvec::SmallVec;

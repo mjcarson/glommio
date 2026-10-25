@@ -199,7 +199,7 @@ pub use self::{
     read_result::ReadResult,
     stat::Stat,
 };
-pub use crate::sys::DmaBuffer;
+pub use crate::sys::{DmaBuffer, OwnedDmaBuffer};
 
 #[cfg(test)]
 mod test {

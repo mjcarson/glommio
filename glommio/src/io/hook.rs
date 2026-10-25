@@ -256,8 +256,12 @@ mod test {
             );
             file.close().await.unwrap();
 
-            // a lost directory fails every operation in it, and nothing beside it
+            // a lost directory fails every operation in it, and nothing beside it: a read into a
+            // caller's buffer as well
+            let reread = DmaFile::open(inside.join("direct")).await.unwrap();
             *TEST_HOOK.lost.lock().unwrap() = true;
+            let buf = crate::io::OwnedDmaBuffer::new(align).unwrap();
+            assert!(reread.read_into_at(buf, 0).await.is_err());
             assert!(BufferedFile::create(inside.join("again")).await.is_err());
             assert!(crate::io::remove(inside.join("buffered")).await.is_err());
             let beside = BufferedFile::create(outside.join("fine")).await.unwrap();
@@ -265,6 +269,7 @@ mod test {
             beside.fdatasync().await.unwrap();
             beside.close().await.unwrap();
             *TEST_HOOK.lost.lock().unwrap() = false;
+            reread.close().await.unwrap();
             *TEST_HOOK.dir.lock().unwrap() = None;
         });
     }

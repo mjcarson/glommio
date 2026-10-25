@@ -538,6 +538,49 @@ impl Reactor {
         }
     }
 
+    /// Read into a caller's buffer, which the source holds until its completion is consumed
+    ///
+    /// Never shared with another read of an overlapping range, as a scheduled read may be: the
+    /// buffer is the caller's, and only this read fills it.
+    pub(crate) fn read_into(
+        &self,
+        raw: RawFd,
+        pos: u64,
+        buffer: DmaBuffer,
+        pollable: PollableStatus,
+    ) -> Source {
+        let stats = StatsCollection {
+            fulfilled: Some(|result, stats, op_count| {
+                if let Ok(result) = result {
+                    stats.file_reads += op_count;
+                    stats.file_bytes_read += *result as u64 * op_count;
+                }
+            }),
+            reused: None,
+            latency: if self.record_io_latencies {
+                Some(|pre_lat, io_lat, post_lat, stats| {
+                    stats
+                        .pre_reactor_io_scheduler_latency_us
+                        .add(pre_lat.as_micros() as f64);
+                    stats.io_latency_us.add(io_lat.as_micros() as f64);
+                    stats
+                        .post_reactor_io_scheduler_latency_us
+                        .add(post_lat.as_micros() as f64)
+                })
+            } else {
+                None
+            },
+        };
+        let size = buffer.len();
+        let source = self.new_source(
+            raw,
+            SourceType::Read(pollable, Some(IoBuffer::DmaSink(buffer))),
+            Some(stats),
+        );
+        self.sys.read_into(&source, pos, size);
+        source
+    }
+
     pub(crate) fn read_buffered(
         &self,
         raw: RawFd,
