@@ -2413,10 +2413,13 @@ mod test {
         let sync_pos = writer.sync_background().await.unwrap();
         assert_eq!(sync_pos, 5000);
 
-        // synced_pos may not be updated yet (background task hasn't run)
-        // Yield to let the background fdatasync task complete
-        futures_lite::future::yield_now().await;
-        futures_lite::future::yield_now().await;
+        // synced_pos may not be updated yet (background task hasn't run). The fdatasync is
+        // submitted and reaped only when the executor polls its rings, which a yield never
+        // reaches while this task is runnable, so wait on a timer, which parks the executor
+        let started = std::time::Instant::now();
+        while writer.current_synced_pos() < 5000 && started.elapsed() < Duration::from_secs(10) {
+            Timer::new(Duration::from_millis(1)).await;
+        }
         assert_eq!(writer.current_synced_pos(), 5000);
 
         writer.close().await.unwrap();
