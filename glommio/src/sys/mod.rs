@@ -355,6 +355,11 @@ impl SleepNotifier {
         self.notify(force_notify);
     }
 
+    /// How many foreign wakes wait to be processed, for the sleep probe
+    pub(crate) fn foreign_pending(&self) -> usize {
+        self.foreign_wakes.len()
+    }
+
     pub(crate) fn process_foreign_wakes(&self) -> usize {
         let mut processed = 0;
         while let Ok(waker) = self.foreign_wakes.try_recv() {

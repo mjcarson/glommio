@@ -196,4 +196,9 @@ impl LocalExecutor {
     pub(crate) fn is_active(&self) -> bool {
         !self.local_queue.queue.borrow().is_empty()
     }
+
+    /// How many runnable tasks wait in this queue, for the sleep probe
+    pub(crate) fn runnable(&self) -> usize {
+        self.local_queue.queue.borrow().len()
+    }
 }

@@ -1087,6 +1087,66 @@ impl<T> PoolThreadHandles<T> {
     }
 }
 
+/// Every task queue of this thread's executor that holds runnable tasks, by name with how many, and
+/// how many queues are on the active list: what the sleep probe reports when an executor is about
+/// to sleep, since one that sleeps with either never runs that work until something else wakes it
+pub(crate) fn runnable_queues() -> (Vec<(String, usize)>, usize) {
+    // the queues as they stand, borrowed only to read them
+    let read = |queues: &ExecutorQueues| {
+        let runnable = queues
+            .available_executors
+            .values()
+            .filter_map(|queue| {
+                let queue = queue.borrow();
+                let tasks = queue.ex.runnable();
+                (tasks > 0).then(|| (queue.name.clone(), tasks))
+            })
+            .collect();
+        (runnable, queues.active_executors.len())
+    };
+    // a reactor driven with no executor on its thread, as its own tests drive one, holds no queues
+    #[cfg(any(not(nightly), not(feature = "native-tls")))]
+    {
+        if !LOCAL_EX.is_set() {
+            return (Vec::new(), 0);
+        }
+        LOCAL_EX.with(|local_ex| read(&local_ex.queues.borrow()))
+    }
+
+    #[cfg(all(nightly, feature = "native-tls"))]
+    unsafe {
+        match LOCAL_EX.as_ref() {
+            Some(local_ex) => read(&local_ex.queues.borrow()),
+            None => (Vec::new(), 0),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of this thread's next runs of its task queues begin with a preemption due, as one
+    /// whose timer fired while the thread was descheduled does
+    static PREEMPT_AT_ENTRY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread's executor would have slept with runnable tasks queued
+    pub(crate) static SLEPT_WITH_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this run of the task queues begins with a preemption a test made due
+#[cfg(test)]
+fn preempt_due_at_entry() -> bool {
+    PREEMPT_AT_ENTRY.with(|left| {
+        let due = left.get() > 0;
+        left.set(left.get().saturating_sub(1));
+        due
+    })
+}
+
+/// Outside tests a preemption is due only when its timer fired
+#[cfg(not(test))]
+fn preempt_due_at_entry() -> bool {
+    false
+}
+
 pub(crate) fn maybe_activate(tq: Rc<RefCell<TaskQueue>>) {
     #[cfg(any(not(nightly), not(feature = "native-tls")))]
     LOCAL_EX.with(|local_ex| {
@@ -1350,12 +1410,21 @@ impl LocalExecutor {
         self.reactor.need_preempt()
     }
 
+    /// Run the active task queues until the executor is preempted or none is left, and say whether
+    /// there may be work to come back to: something ran, or a queue is still active.
+    ///
+    /// A preemption can already be due when this is entered, before any queue ran: the timer
+    /// `poll_io` just installed fired while the thread was descheduled, which a queue that wants a
+    /// short latency makes likely. Answering `false` then told `run` there was nothing to run, and it
+    /// parked with active queues holding runnable tasks, asleep until an unrelated event woke it, or
+    /// for good when none came.
     fn run_task_queues(&self) -> bool {
         let mut ran = false;
         loop {
             self.reactor.sys.install_eventfd();
-            if self.need_preempt() {
-                break;
+            if self.need_preempt() || (!ran && preempt_due_at_entry()) {
+                // preempted with queues still active is work to come back to, never nothing to run
+                return ran || !self.queues.borrow().active_executors.is_empty();
             }
             if !self.run_one_task_queue() {
                 return false;
@@ -1363,7 +1432,6 @@ impl LocalExecutor {
                 ran = true;
             }
         }
-        ran
     }
 
     fn run_one_task_queue(&self) -> bool {
@@ -4017,6 +4085,24 @@ mod test {
             .detach();
             join_all(vec![jh, jh2]).await;
         });
+    }
+
+    /// A run of the task queues that begins with a preemption due, before any queue ran, says there
+    /// is work to come back to while a queue is active, so the executor never parks with runnable
+    /// tasks: it answered nothing ran, and its loop parked with the main task queued, asleep until
+    /// something unrelated woke it (Shoal's item 249)
+    #[test]
+    fn a_preemption_due_as_the_queues_run_begins_never_parks_with_work() {
+        // the first three runs of the queues begin with a preemption due
+        PREEMPT_AT_ENTRY.with(|left| left.set(3));
+        SLEPT_WITH_WORK.with(|slept| slept.set(0));
+        let answer = LocalExecutor::default().run(async { 42 });
+        assert_eq!(answer, 42);
+        assert_eq!(
+            SLEPT_WITH_WORK.with(std::cell::Cell::get),
+            0,
+            "the executor went to sleep with runnable tasks queued"
+        );
     }
 
     #[test]

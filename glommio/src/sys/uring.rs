@@ -1293,6 +1293,55 @@ macro_rules! flush_rings {
     }}
 }
 
+/// Whether this thread's executor holds runnable tasks as it is about to sleep, counted for a test
+/// that holds it never does
+#[cfg(test)]
+fn sleeps_with_work() -> bool {
+    let (runnable, active) = crate::executor::runnable_queues();
+    let with_work = !runnable.is_empty() || active > 0;
+    if with_work {
+        crate::executor::SLEPT_WITH_WORK.with(|slept| slept.set(slept.get() + 1));
+    }
+    with_work
+}
+
+/// Outside tests the sleep is never checked here
+#[cfg(not(test))]
+fn sleeps_with_work() -> bool {
+    false
+}
+
+/// Where the sleep probe appends what it finds, read once from `GLOMMIO_SLEEP_PROBE`
+static SLEEP_PROBE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Report, where `GLOMMIO_SLEEP_PROBE` names a file, an executor about to sleep with work it never
+/// ran: a task queue holding runnable tasks, a queue on the active list, or a foreign wake not yet
+/// processed. None of these should ever be true here; a probe that finds one has found a sleep
+/// that waits for something else to wake it. Written straight to a file, since a test's capture
+/// would hold it until the test ends, which a hung test never does.
+///
+/// # Arguments
+///
+/// * `notifier` - The executor's sleep notifier, which holds its foreign wakes
+fn sleep_probe(notifier: &sys::SleepNotifier) {
+    let Some(path) = SLEEP_PROBE.get_or_init(|| std::env::var_os("GLOMMIO_SLEEP_PROBE").map(Into::into)) else {
+        return;
+    };
+    let (runnable, active) = crate::executor::runnable_queues();
+    let foreign = notifier.foreign_pending();
+    if runnable.is_empty() && active == 0 && foreign == 0 {
+        return;
+    }
+    let line = format!(
+        "executor {} on thread {:?} sleeps with runnable queues {runnable:?}, {active} on the active list and {foreign} foreign wakes pending\n",
+        notifier.id(),
+        std::thread::current().name()
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
+}
+
 fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
 }
@@ -1889,7 +1938,13 @@ impl Reactor {
             membarrier::heavy();
             let events = process_remote_channels() + self.flush_syscall_thread();
             if events == 0 {
+                // an executor holding runnable tasks is never to sleep; a test counts it and does not
+                if cfg!(test) && sleeps_with_work() {
+                    return Ok(true);
+                }
                 if self.eventfd_src.is_installed().unwrap() {
+                    // what the executor holds runnable as it sleeps, reported where the probe asks
+                    sleep_probe(&self.notifier);
                     self.link_rings_and_sleep(&mut main_ring)
                         .expect("some error");
                     // May have new cancellations related to the link ring fd.
