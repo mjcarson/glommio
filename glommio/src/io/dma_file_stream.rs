@@ -2367,40 +2367,52 @@ mod test {
     // A partial flush writes the whole aligned buffer. Whatever lies past the stream's position
     // is on disk until a clean close truncates it, and after a crash it is what a reader of the
     // file meets past its logical end, so it has to be zeros, never recycled buffer memory.
-    file_stream_write_test!(partial_flush_writes_zeros_past_the_position, path, _k, filename, file, {
-        let file = Rc::new(file);
-        // recycled buffers that held other data, so a fresh allocation is likely to reuse one
-        for _ in 0..8 {
-            let mut stale = file.alloc_dma_buffer(4096);
-            stale.memset(0xAB);
-            drop(stale);
+    file_stream_write_test!(
+        partial_flush_writes_zeros_past_the_position,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let file = Rc::new(file);
+            // recycled buffers that held other data, so a fresh allocation is likely to reuse one
+            for _ in 0..8 {
+                let mut stale = file.alloc_dma_buffer(4096);
+                stale.memset(0xAB);
+                drop(stale);
+            }
+            let writable = crate::io::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .dma_open(&filename)
+                .await
+                .unwrap();
+            let mut writer = DmaStreamWriterBuilder::new(writable)
+                .with_buffer_size(4096)
+                .with_write_behind(2)
+                .build();
+            // a hundred bytes, then more recycled garbage, then a sync that flushes a partial buffer
+            writer.write_all(&[7u8; 100]).await.unwrap();
+            for _ in 0..8 {
+                let mut stale = file.alloc_dma_buffer(4096);
+                stale.memset(0xAB);
+                drop(stale);
+            }
+            writer.sync().await.unwrap();
+            // and more written after the sync, flushed partially again
+            writer.write_all(&[9u8; 50]).await.unwrap();
+            writer.sync().await.unwrap();
+            // read the file as a crash would leave it, before any close truncates it
+            let on_disk = std::fs::read(&filename).unwrap();
+            assert!(on_disk.len() >= 150);
+            assert!(on_disk[..100].iter().all(|b| *b == 7));
+            assert!(on_disk[100..150].iter().all(|b| *b == 9));
+            let stale = on_disk[150..].iter().filter(|b| **b != 0).count();
+            assert_eq!(stale, 0, "{stale} bytes past the position are not zero");
+            writer.close().await.unwrap();
+            file.close_rc().await.unwrap();
         }
-        let writable = crate::io::OpenOptions::new().read(true).write(true).dma_open(&filename).await.unwrap();
-        let mut writer = DmaStreamWriterBuilder::new(writable)
-            .with_buffer_size(4096)
-            .with_write_behind(2)
-            .build();
-        // a hundred bytes, then more recycled garbage, then a sync that flushes a partial buffer
-        writer.write_all(&[7u8; 100]).await.unwrap();
-        for _ in 0..8 {
-            let mut stale = file.alloc_dma_buffer(4096);
-            stale.memset(0xAB);
-            drop(stale);
-        }
-        writer.sync().await.unwrap();
-        // and more written after the sync, flushed partially again
-        writer.write_all(&[9u8; 50]).await.unwrap();
-        writer.sync().await.unwrap();
-        // read the file as a crash would leave it, before any close truncates it
-        let on_disk = std::fs::read(&filename).unwrap();
-        assert!(on_disk.len() >= 150);
-        assert!(on_disk[..100].iter().all(|b| *b == 7));
-        assert!(on_disk[100..150].iter().all(|b| *b == 9));
-        let stale = on_disk[150..].iter().filter(|b| **b != 0).count();
-        assert_eq!(stale, 0, "{stale} bytes past the position are not zero");
-        writer.close().await.unwrap();
-        file.close_rc().await.unwrap();
-    });
+    );
 
     file_stream_write_test!(sync_background_basic, path, _k, filename, file, {
         let mut writer = DmaStreamWriterBuilder::new(file)
