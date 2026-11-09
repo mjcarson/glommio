@@ -180,9 +180,16 @@ impl Reactor {
         io_memory: usize,
         ring_depth: usize,
         record_io_latencies: bool,
+        io_worker_cpus: Option<&[usize]>,
         blocking_thread: BlockingThreadPool,
     ) -> io::Result<Reactor> {
-        let sys = sys::Reactor::new(notifier, io_memory, ring_depth, blocking_thread)?;
+        let sys = sys::Reactor::new(
+            notifier,
+            io_memory,
+            ring_depth,
+            io_worker_cpus,
+            blocking_thread,
+        )?;
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
         Ok(Reactor {
             sys,

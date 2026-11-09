@@ -248,6 +248,18 @@ impl TaskQueue {
     }
 }
 
+/// The cpus of a set, in order, as an io-wq affinity names them
+///
+/// # Arguments
+///
+/// * `cpus` - The cpus the workers may run on
+fn io_worker_cpus_of(cpus: CpuSet) -> Vec<usize> {
+    // every location's cpu, ordered so the builder's debug output is stable
+    let mut cpus: Vec<usize> = cpus.into_iter().map(|location| location.cpu).collect();
+    cpus.sort_unstable();
+    cpus
+}
+
 pub(crate) fn bind_to_cpu_set(cpus: impl IntoIterator<Item = usize>) -> Result<()> {
     let mut cpuset = nix::sched::CpuSet::new();
     for cpu in cpus {
@@ -506,6 +518,9 @@ pub struct LocalExecutorBuilder {
     /// Defaults to one thread using the same placement strategy as the host
     /// executor
     blocking_thread_pool_placement: PoolPlacement,
+    /// The cpus the io-wq workers of this executor's rings run on, or the
+    /// executor's own placement when none are named
+    io_worker_cpus: Option<Vec<usize>>,
     /// Whether to detect stalls in unyielding tasks.
     /// [`stall::DefaultStallDetectionHandler`] installs a signal handler for
     /// [`nix::libc::SIGUSR1`], so is disabled by default.
@@ -528,6 +543,7 @@ impl LocalExecutorBuilder {
             preempt_timer_duration: DEFAULT_PREEMPT_TIMER,
             record_io_latencies: false,
             blocking_thread_pool_placement: PoolPlacement::from(placement),
+            io_worker_cpus: None,
             detect_stalls: None,
         }
     }
@@ -609,6 +625,22 @@ impl LocalExecutorBuilder {
         self
     }
 
+    /// The cpus the io-wq workers of the executor's rings run on.
+    ///
+    /// The kernel runs a request it cannot complete inline, such as an
+    /// `fdatasync`, on a worker thread of the submitting thread's io-wq, and
+    /// that worker takes the executor's own cpu unless told otherwise, so it
+    /// preempts the executor for as long as it runs. Named here, the set is
+    /// registered (`IORING_REGISTER_IOWQ_AFF`, Linux 5.14) as the executor's
+    /// first ring is created, before any request could be punted. A set that
+    /// includes the executor's own cpu leaves its workers there on Linux 7.0,
+    /// and an empty set fails the executor's creation.
+    #[must_use = "The builder must be built to be useful"]
+    pub fn io_worker_cpus(mut self, cpus: CpuSet) -> LocalExecutorBuilder {
+        self.io_worker_cpus = Some(io_worker_cpus_of(cpus));
+        self
+    }
+
     /// Whether to detect stalls in unyielding tasks.
     /// [`stall::DefaultStallDetectionHandler`] installs a signal handler for
     /// [`nix::libc::SIGUSR1`], so is disabled by default.
@@ -653,6 +685,7 @@ impl LocalExecutorBuilder {
                 record_io_latencies: self.record_io_latencies,
                 spin_before_park: self.spin_before_park,
                 thread_pool_placement: self.blocking_thread_pool_placement,
+                io_worker_cpus: self.io_worker_cpus,
                 detect_stalls: self.detect_stalls,
             },
         )?;
@@ -720,6 +753,7 @@ impl LocalExecutorBuilder {
         let detect_stalls = self.detect_stalls;
         let record_io_latencies = self.record_io_latencies;
         let blocking_thread_pool_placement = self.blocking_thread_pool_placement;
+        let io_worker_cpus = self.io_worker_cpus;
 
         Builder::new()
             .name(name)
@@ -734,6 +768,7 @@ impl LocalExecutorBuilder {
                         record_io_latencies,
                         spin_before_park,
                         thread_pool_placement: blocking_thread_pool_placement,
+                        io_worker_cpus,
                         detect_stalls,
                     },
                 )?;
@@ -799,6 +834,9 @@ pub struct LocalExecutorPoolBuilder {
     /// its own pool. Defaults to 1 thread per pool, bound using the same
     /// placement strategy as its host executor
     blocking_thread_pool_placement: PoolPlacement,
+    /// The cpus the io-wq workers of every executor's rings run on, or each
+    /// executor's own placement when none are named
+    io_worker_cpus: Option<Vec<usize>>,
     /// Factory function to generate the stall detection handler.
     /// [`DefaultStallDetectionHandler installs`] a signal handler for
     /// [`nix::libc::SIGUSR1`], so is disabled by default.
@@ -818,6 +856,7 @@ impl fmt::Debug for LocalExecutorPoolBuilder {
                 "blocking_thread_pool_placement",
                 &self.blocking_thread_pool_placement,
             )
+            .field("io_worker_cpus", &self.io_worker_cpus)
             .finish_non_exhaustive()
     }
 }
@@ -838,6 +877,7 @@ impl LocalExecutorPoolBuilder {
             placement: placement.clone(),
             record_io_latencies: false,
             blocking_thread_pool_placement: placement.shrink_to(1),
+            io_worker_cpus: None,
             handler_gen: None,
         }
     }
@@ -901,6 +941,15 @@ impl LocalExecutorPoolBuilder {
     #[must_use = "The builder must be built to be useful"]
     pub fn blocking_thread_pool_placement(mut self, placement: PoolPlacement) -> Self {
         self.blocking_thread_pool_placement = placement;
+        self
+    }
+
+    /// Please see documentation under [`LocalExecutorBuilder::io_worker_cpus`]
+    /// for details. The setting is applied to all executors in the pool: every
+    /// executor's workers run on the one set.
+    #[must_use = "The builder must be built to be useful"]
+    pub fn io_worker_cpus(mut self, cpus: CpuSet) -> Self {
+        self.io_worker_cpus = Some(io_worker_cpus_of(cpus));
         self
     }
 
@@ -1000,6 +1049,7 @@ impl LocalExecutorPoolBuilder {
             let spin_before_park = self.spin_before_park;
             let record_io_latencies = self.record_io_latencies;
             let blocking_thread_pool_placement = self.blocking_thread_pool_placement.clone();
+            let io_worker_cpus = self.io_worker_cpus.clone();
             let detect_stalls = self.handler_gen.as_ref().map(|x| (*x.deref())());
             let latch = Latch::clone(latch);
 
@@ -1017,6 +1067,7 @@ impl LocalExecutorPoolBuilder {
                             record_io_latencies,
                             spin_before_park,
                             thread_pool_placement: blocking_thread_pool_placement,
+                            io_worker_cpus,
                             detect_stalls,
                         },
                     )?;
@@ -1172,6 +1223,9 @@ pub struct LocalExecutorConfig {
     pub record_io_latencies: bool,
     pub spin_before_park: Option<Duration>,
     pub thread_pool_placement: PoolPlacement,
+    /// The cpus the io-wq workers of the executor's rings run on, its own when
+    /// none are named
+    pub io_worker_cpus: Option<Vec<usize>>,
     pub detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
 }
 
@@ -1259,6 +1313,7 @@ impl LocalExecutor {
                 config.io_memory,
                 config.ring_depth,
                 config.record_io_latencies,
+                config.io_worker_cpus.as_deref(),
                 blocking_thread,
             )?),
             stall_detector: RefCell::new(
@@ -4374,5 +4429,197 @@ mod test {
         #[cfg(all(nightly, feature = "native-tls"))]
 
         assert!(unsafe { LOCAL_EX.is_null() });
+    }
+
+    /// The cpus this process may run on, the highest first, so the tests that
+    /// pin executors keep off cpu 0, where the suite's spinning test is timed
+    fn allowed_cpus() -> Vec<usize> {
+        // the process's affinity, as a container or a taskset narrows it
+        let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+        (0..nix::sched::CpuSet::count())
+            .rev()
+            .filter(|cpu| affinity.is_set(*cpu).unwrap_or(false))
+            .collect()
+    }
+
+    /// The cpus a kernel `Cpus_allowed_list` names, such as `0-1,5`
+    ///
+    /// # Arguments
+    ///
+    /// * `list` - The list as `/proc` prints it
+    fn parse_cpu_list(list: &str) -> std::collections::BTreeSet<usize> {
+        // each comma-separated piece is a cpu or an inclusive range of them
+        let mut cpus = std::collections::BTreeSet::new();
+        for piece in list.trim().split(',').filter(|piece| !piece.is_empty()) {
+            match piece.split_once('-') {
+                Some((first, last)) => {
+                    cpus.extend(first.parse::<usize>().unwrap()..=last.parse::<usize>().unwrap())
+                }
+                None => {
+                    cpus.insert(piece.parse::<usize>().unwrap());
+                }
+            }
+        }
+        cpus
+    }
+
+    /// The cpus each io-wq worker of a thread may run on, read from `/proc`
+    ///
+    /// # Arguments
+    ///
+    /// * `tid` - The thread whose workers are read, which the kernel names
+    ///   them after (`iou-wrk-<tid>`)
+    fn io_workers_of(tid: i32) -> Vec<std::collections::BTreeSet<usize>> {
+        // every thread of this process, the io-wq workers among them
+        let name = format!("iou-wrk-{tid}");
+        let mut workers = Vec::new();
+        for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            // a thread that exited between the listing and the read is skipped
+            let Ok(comm) = std::fs::read_to_string(task.path().join("comm")) else {
+                continue;
+            };
+            if comm.trim() != name {
+                continue;
+            }
+            let Ok(status) = std::fs::read_to_string(task.path().join("status")) else {
+                continue;
+            };
+            // the worker's affinity, as the scheduler holds it
+            let list = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                .expect("a thread's status names its cpus");
+            workers.push(parse_cpu_list(list));
+        }
+        workers
+    }
+
+    /// Sync a file, which the kernel always runs on an io-wq worker, and read
+    /// where this thread's workers may run
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - A directory to make the file in
+    async fn sync_and_read_workers(
+        dir: std::path::PathBuf,
+    ) -> Vec<std::collections::BTreeSet<usize>> {
+        // a file of this thread's own, written and synced
+        let tid = nix::unistd::gettid().as_raw();
+        let path = dir.join(format!("synced-{tid}"));
+        let file = crate::io::BufferedFile::create(&path).await.unwrap();
+        file.write_at(vec![7u8; 4096], 0).await.unwrap();
+        // an fdatasync is never completed inline, so it starts this thread's first worker
+        file.fdatasync().await.unwrap();
+        file.close().await.unwrap();
+        // the worker outlives the sync for its idle timeout, so it is there to read
+        io_workers_of(tid)
+    }
+
+    /// A ring's io-wq workers run on the cpus the builder names, never on the
+    /// executor's own (O147)
+    #[test]
+    fn an_executors_io_workers_run_on_the_cpus_named() {
+        // two cpus: the executor's, and one for its workers
+        let cpus = allowed_cpus();
+        if cpus.len() < 2 {
+            eprintln!("an_executors_io_workers_run_on_the_cpus_named needs two cpus, has {cpus:?}");
+            return;
+        }
+        let (own, named) = (cpus[0], cpus[1]);
+        let dir = crate::test_utils::make_tmp_test_directory("io_workers_named");
+        let path = dir.path.clone();
+        // the executor pinned to one cpu and its workers sent to the other
+        let workers = LocalExecutorBuilder::new(Placement::Fixed(own))
+            .io_worker_cpus(
+                CpuSet::online()
+                    .unwrap()
+                    .filter(|location| location.cpu == named),
+            )
+            .spawn(move || sync_and_read_workers(path))
+            .unwrap()
+            .join()
+            .unwrap();
+        // every worker the sync started is on the named cpu alone
+        assert!(!workers.is_empty(), "the sync started no worker");
+        for worker in workers {
+            assert_eq!(worker, std::collections::BTreeSet::from([named]));
+        }
+    }
+
+    /// A ring's io-wq workers take the executor's own cpu when no set is named,
+    /// which is what O147 moves
+    #[test]
+    fn an_executors_io_workers_take_its_own_cpu_unless_named() {
+        // one cpu is enough to be pinned to
+        let cpus = allowed_cpus();
+        let own = cpus[0];
+        let dir = crate::test_utils::make_tmp_test_directory("io_workers_own");
+        let path = dir.path.clone();
+        // the executor pinned, its workers left alone
+        let workers = LocalExecutorBuilder::new(Placement::Fixed(own))
+            .spawn(move || sync_and_read_workers(path))
+            .unwrap()
+            .join()
+            .unwrap();
+        // every worker inherited the executor's one cpu
+        assert!(!workers.is_empty(), "the sync started no worker");
+        for worker in workers {
+            assert_eq!(worker, std::collections::BTreeSet::from([own]));
+        }
+    }
+
+    /// Every executor of a pool sends its io-wq workers to the one set named
+    #[test]
+    fn a_pools_executors_send_their_io_workers_to_the_cpus_named() {
+        // two executors' cpus and a third for every worker
+        let cpus = allowed_cpus();
+        if cpus.len() < 3 {
+            eprintln!(
+                "a_pools_executors_send_their_io_workers_to_the_cpus_named needs three cpus, has {cpus:?}"
+            );
+            return;
+        }
+        let named = cpus[2];
+        let executors: Vec<CpuSet> = cpus[..2]
+            .iter()
+            .map(|cpu| {
+                CpuSet::online()
+                    .unwrap()
+                    .filter(|location| location.cpu == *cpu)
+            })
+            .collect();
+        let dir = crate::test_utils::make_tmp_test_directory("io_workers_pool");
+        let path = dir.path.clone();
+        // each executor syncs a file of its own and reads its own workers
+        let handles = LocalExecutorPoolBuilder::new(PoolPlacement::Custom(executors))
+            .io_worker_cpus(
+                CpuSet::online()
+                    .unwrap()
+                    .filter(|location| location.cpu == named),
+            )
+            .on_all_shards(move || sync_and_read_workers(path))
+            .unwrap();
+        let results = handles.join_all();
+        assert_eq!(results.len(), 2);
+        // every executor's every worker is on the named cpu
+        for result in results {
+            let workers = result.unwrap();
+            assert!(!workers.is_empty(), "a sync started no worker");
+            for worker in workers {
+                assert_eq!(worker, std::collections::BTreeSet::from([named]));
+            }
+        }
+    }
+
+    /// An empty set of io-wq cpus fails the executor's creation rather than
+    /// leaving its workers wherever the kernel puts them
+    #[test]
+    fn an_empty_io_worker_set_fails_the_executor() {
+        // a set with no cpu in it
+        let none = CpuSet::online().unwrap().filter(|_| false);
+        let made = LocalExecutorBuilder::new(Placement::Unbound)
+            .io_worker_cpus(none)
+            .make();
+        assert!(made.is_err());
     }
 }

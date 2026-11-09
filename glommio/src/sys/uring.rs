@@ -1351,6 +1351,7 @@ impl Reactor {
         notifier: Arc<sys::SleepNotifier>,
         mut io_memory: usize,
         ring_depth: usize,
+        io_worker_cpus: Option<&[usize]>,
         blocking_thread: BlockingThreadPool,
     ) -> crate::Result<Reactor, ()> {
         const MIN_MEMLOCK_LIMIT: u64 = 512 * 1024;
@@ -1371,6 +1372,12 @@ impl Reactor {
 
         let main_ring =
             SleepableRing::new(ring_depth, "main", allocator.clone(), source_map.clone())?;
+        // the thread's io-wq exists once its first ring does, and every ring of the thread shares
+        // it, so its workers are placed here: before any request this executor makes could be
+        // punted to one, since a worker started earlier would keep the executor's own cpu
+        if let Some(cpus) = io_worker_cpus {
+            main_ring.registrar().register_iowq_aff(cpus)?;
+        }
         let poll_ring = PollRing::new(ring_depth, allocator.clone(), source_map.clone())?;
         let mut latency_ring =
             SleepableRing::new(ring_depth, "latency", allocator.clone(), source_map.clone())?;
@@ -2117,7 +2124,7 @@ mod tests {
     fn timeout_smoke_test() {
         let notifier = sys::new_sleep_notifier().unwrap();
         let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
-        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, None, pool).unwrap();
 
         fn timeout_source(millis: u64) -> (Source, UringOpDescriptor) {
             let source = Source::new(

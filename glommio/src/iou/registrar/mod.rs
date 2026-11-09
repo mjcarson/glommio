@@ -202,6 +202,57 @@ impl<'ring> Registrar<'ring> {
     pub fn probe(&self) -> io::Result<Probe> {
         Probe::for_ring(self.ring.as_ptr())
     }
+
+    /// Bind the io-wq workers of the calling thread's rings to a set of cpus
+    ///
+    /// The kernel keeps one io-wq a thread, shared by every ring the thread
+    /// submits to, so one call covers all of them. A worker it starts after
+    /// the call runs on these cpus, and a worker started before keeps the
+    /// cpus it had, so the call belongs before the thread's first request
+    /// that may be punted. Linux 7.0 leaves a worker on its thread's own cpu
+    /// when the set includes that cpu, and takes an offline cpu without a
+    /// word, so a caller judges the set itself. Needs Linux 5.14.
+    ///
+    /// # Arguments
+    ///
+    /// * `cpus` - The cpus the workers may run on, at least one
+    ///
+    /// # Errors
+    ///
+    /// An empty set, a cpu past what a `cpu_set_t` holds, or the kernel's
+    /// refusal.
+    pub fn register_iowq_aff(&self, cpus: &[usize]) -> io::Result<()> {
+        // an empty mask is no placement at all, which the kernel would refuse less clearly
+        if cpus.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an io-wq affinity names at least one cpu",
+            ));
+        }
+        // the mask, every cpu checked against what a cpu_set_t holds before it is set
+        let mut mask = nix::sched::CpuSet::new();
+        for &cpu in cpus {
+            mask.set(cpu).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "cpu {cpu} is past the {} a cpu set holds",
+                        nix::sched::CpuSet::count()
+                    ),
+                )
+            })?;
+        }
+        // nix's set is a transparent wrapper of the libc mask the kernel reads
+        let raw = &mask as *const nix::sched::CpuSet as *const libc::cpu_set_t;
+        resultify(unsafe {
+            uring_sys::io_uring_register_iowq_aff(
+                self.ring.as_ptr(),
+                std::mem::size_of::<libc::cpu_set_t>(),
+                raw,
+            )
+        })?;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for Registrar<'_> {

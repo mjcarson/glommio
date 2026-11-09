@@ -388,6 +388,13 @@ extern "C" {
     pub fn io_uring_register_personality(ring: *mut io_uring) -> libc::c_int;
 
     pub fn io_uring_unregister_personality(ring: *mut io_uring, id: libc::c_int) -> libc::c_int;
+
+    /// Bind the io-wq workers of the calling thread to the cpus in `mask` (Linux 5.14)
+    pub fn io_uring_register_iowq_aff(
+        ring: *mut io_uring,
+        cpusz: libc::size_t,
+        mask: *const libc::cpu_set_t,
+    ) -> libc::c_int;
 }
 
 #[link(name = "rusturing")]
