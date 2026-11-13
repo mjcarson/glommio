@@ -1260,6 +1260,18 @@ pub struct LocalExecutor {
     id: usize,
     reactor: Rc<reactor::Reactor>,
     stall_detector: RefCell<Option<StallDetector>>,
+    /// When this executor last polled its rings, which submits what its tasks queued and reaps
+    /// what completed
+    last_poll: std::cell::Cell<Instant>,
+    /// Whether a preemption is also due once the shortest latency of the queues active now has
+    /// passed since the last poll, and not only when the timer that poll armed fires
+    ///
+    /// The timer is armed at a poll for the queues active then, so a queue with a short latency
+    /// that becomes active after a poll made while none was waits out the poll's longer timer,
+    /// up to `DEFAULT_PREEMPT_TIMER`, with nothing submitted or reaped meanwhile. Off unless
+    /// `GLOMMIO_PREEMPT_ON_DEADLINE` is set to `1` when the executor is made: a diagnostic, which
+    /// reads the clock at every check while it is on (Shoal's item 391).
+    preempt_on_deadline: bool,
 }
 
 impl LocalExecutor {
@@ -1316,6 +1328,8 @@ impl LocalExecutor {
                 config.io_worker_cpus.as_deref(),
                 blocking_thread,
             )?),
+            last_poll: std::cell::Cell::new(Instant::now()),
+            preempt_on_deadline: std::env::var("GLOMMIO_PREEMPT_ON_DEADLINE").is_ok_and(|value| value == "1"),
             stall_detector: RefCell::new(
                 config
                     .detect_stalls
@@ -1462,7 +1476,10 @@ impl LocalExecutor {
 
     #[inline(always)]
     pub(crate) fn need_preempt(&self) -> bool {
+        // the latency ring's timer or event, and, while the diagnostic is on, the shortest latency
+        // of the queues active now passed since the last poll
         self.reactor.need_preempt()
+            || (self.preempt_on_deadline && self.last_poll.get().elapsed() >= self.preempt_timer_duration())
     }
 
     /// Run the active task queues until the executor is preempted or none is left, and say whether
@@ -1631,6 +1648,8 @@ impl LocalExecutor {
                 this.parker
                     .poll_io(|| Some(this.preempt_timer_duration()))
                     .expect("Failed to poll io! This is actually pretty bad!");
+                // the deadline a preemption is judged by, while the diagnostic is on
+                this.last_poll.set(Instant::now());
 
                 // run user code
                 let run = this.run_task_queues();
