@@ -818,11 +818,13 @@ impl PollRing {
         allocator: Rc<UringBufferAllocator>,
         source_map: Rc<RefCell<SourceMap>>,
     ) -> io::Result<Self> {
+        // a refusal for memory said with how to raise the limit it most often is
         let ring = iou::IoUring::new_with_flags(
             size as _,
             iou::SetupFlags::IOPOLL,
             iou::SetupFeatures::empty(),
-        )?;
+        )
+        .map_err(|error| ring_error("poll", error))?;
         Ok(PollRing {
             size,
             ring,
@@ -938,7 +940,7 @@ impl SleepableRing {
     ) -> io::Result<Self> {
         assert!(*IO_URING_RECENT_ENOUGH);
         Ok(SleepableRing {
-            ring: iou::IoUring::new(size as _)?,
+            ring: iou::IoUring::new(size as _).map_err(|error| ring_error(name, error))?,
             size,
             submission_queue: UringQueueState::with_capacity(size * 4),
             name,
@@ -1344,6 +1346,41 @@ fn sleep_probe(notifier: &sys::SleepNotifier) {
 
 fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
+}
+
+/// A ring's creation's error, said with what to do when it is the user's locked memory that ran out
+///
+/// io_uring charges what it locks for a ring to the locked memory of the user that makes it, shared by every
+/// executor that user runs: many executors at once, such as a test binary's threads, spend a login's 8 MiB, and the
+/// next ring is refused `ENOMEM`, which said nothing of the limit or how to raise it.
+///
+/// # Arguments
+///
+/// * `ring` - Which ring was being made
+/// * `error` - What its creation met
+fn ring_error(ring: &str, error: io::Error) -> io::Error {
+    // anything but a refusal for memory is passed on as it came
+    if error.raw_os_error() != Some(libc::ENOMEM) {
+        return error;
+    }
+    // the limit as it stands, which the message names
+    let limit = match Resource::MEMLOCK.get() {
+        Ok((soft, _)) if soft == rlimit::INFINITY => "unlimited".to_string(),
+        Ok((soft, _)) => format!("{} KiB", soft / 1024),
+        Err(_) => "unknown".to_string(),
+    };
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "io_uring could not create the {ring} ring: {error}. io_uring charges what it locks for its rings and \
+             registered buffers to the locked memory of the user that makes them (RLIMIT_MEMLOCK, {limit} now), \
+             shared by every glommio executor that user runs, so this is most often that limit spent. Raise it, on \
+             Ubuntu: for this shell, `sudo prlimit --pid $$ --memlock=unlimited:unlimited`; for every login, \
+             `echo \"$USER - memlock unlimited\" | sudo tee /etc/security/limits.d/90-memlock.conf` and log in \
+             again; for a systemd unit, `LimitMEMLOCK=infinity`. Or run fewer executors at once, such as \
+             `cargo test -- --test-threads 6`"
+        ),
+    )
 }
 
 impl Reactor {
@@ -2119,6 +2156,22 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// A ring refused for memory says the locked-memory limit and how to raise it on Ubuntu, and any other
+    /// refusal is passed on as it came
+    #[test]
+    fn a_ring_refused_for_memory_says_how_to_raise_the_limit() {
+        // ENOMEM, said with the limit and the ways to raise it
+        let wrapped = ring_error("main", io::Error::from_raw_os_error(libc::ENOMEM));
+        assert_eq!(wrapped.kind(), io::ErrorKind::OutOfMemory);
+        let message = wrapped.to_string();
+        for named in ["main ring", "RLIMIT_MEMLOCK", "prlimit", "/etc/security/limits.d/", "LimitMEMLOCK=infinity"] {
+            assert!(message.contains(named), "the message does not name {named}: {message}");
+        }
+        // and anything else as it was
+        let other = ring_error("main", io::Error::from_raw_os_error(libc::EINVAL));
+        assert_eq!(other.raw_os_error(), Some(libc::EINVAL));
+    }
 
     #[test]
     fn timeout_smoke_test() {
